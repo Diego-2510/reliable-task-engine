@@ -12,7 +12,7 @@ from task_engine import worker as worker_module
 from task_engine.api import app
 from task_engine.db import Session
 from task_engine.models import Job
-from task_engine.worker import LeaseLostError, claim, complete, handle, run_once
+from task_engine.worker import LeaseLostError, claim, complete, handle, recover_expired, run_once
 
 
 def test_handler():
@@ -37,12 +37,35 @@ def test_api_and_worker(database):
     assert client.get('/v1/jobs/' + response.json()['id']).json()['status'] == 'succeeded'
 
 
-def _contender(barrier, results):
+def _contender(barrier, results, recovery):
     # Forked workers must establish their own database connections.
     from task_engine.db import engine
     engine.dispose(close=False)
     barrier.wait(timeout=10)
-    results.put(claim())
+    results.put(recover_expired() if recovery else claim())
+
+
+def parallel_claims(recovery=False):
+    ctx = mp.get_context("fork")
+    barrier = ctx.Barrier(8)
+    results = ctx.Queue()
+    workers = [ctx.Process(target=_contender, args=(barrier, results, recovery)) for _ in range(8)]
+    try:
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=15)
+            assert not worker.is_alive()
+            assert worker.exitcode == 0
+        return [results.get(timeout=3) for _ in workers]
+    finally:
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+            if worker.pid is not None:
+                worker.join(timeout=5)
+        results.close()
+        results.join_thread()
 
 
 @pytest.mark.parametrize("recovery", [False, True])
@@ -54,27 +77,13 @@ def test_concurrent_claim(database, recovery):
         assert first is not None
         old_token = first[1]
         expire(job_id)
-    ctx = mp.get_context("fork")
-    barrier = ctx.Barrier(8)
-    results = ctx.Queue()
-    workers = [ctx.Process(target=_contender, args=(barrier, results)) for _ in range(8)]
-    try:
-        for worker in workers:
-            worker.start()
-        for worker in workers:
-            worker.join(timeout=15)
-            assert not worker.is_alive()
-            assert worker.exitcode == 0
-        claimed = [results.get(timeout=3) for _ in workers]
-    finally:
-        for worker in workers:
-            if worker.is_alive():
-                worker.terminate()
-            if worker.pid is not None:
-                worker.join(timeout=5)
-        results.close()
-        results.join_thread()
-    successful = [result for result in claimed if result is not None]
+        assert sum(parallel_claims(recovery=True)) == 1
+        with Session() as session:
+            job = session.get(Job, job_id)
+            assert job.status == "queued" and job.attempts == 1
+            assert job.lease_token is None
+        make_due(job_id)
+    successful = [result for result in parallel_claims() if result is not None]
     assert len(successful) == 1
     with Session() as session:
         job = session.query(Job).one()
@@ -125,6 +134,8 @@ def test_reclaim_changes_token_and_generation(database):
     first = claim()
     assert first is not None
     expire(job_id)
+    assert recover_expired() == 1
+    make_due(job_id)
     second = claim()
     assert second is not None
     assert first[0] == second[0] == job_id
@@ -142,6 +153,8 @@ def test_fenced_completion_after_reclaim(database, status):
     first = claim()
     assert first is not None
     expire(job_id)
+    assert recover_expired() == 1
+    make_due(job_id)
     second = claim()
     assert second is not None
     with pytest.raises(LeaseLostError):
@@ -228,6 +241,8 @@ def test_worker_recognizes_lost_lease(database, monkeypatch, caplog, fails):
 
     def lose_lease(payload):
         expire(job_id)
+        assert recover_expired() == 1
+        make_due(job_id)
         replacement.append(claim())
         if fails:
             raise ValueError("late synthetic failure")
@@ -240,3 +255,12 @@ def test_worker_recognizes_lost_lease(database, monkeypatch, caplog, fails):
         job = session.get(Job, job_id)
         assert job.status == "running" and job.attempts == 2
         assert job.lease_token == replacement[0][1]
+
+
+def make_due(job_id):
+    """Move the eligibility timestamp relative to PostgreSQL time, without sleeping."""
+    with Session.begin() as session:
+        session.execute(
+            update(Job).where(Job.id == job_id)
+            .values(available_at=func.clock_timestamp() - timedelta(seconds=1))
+        )

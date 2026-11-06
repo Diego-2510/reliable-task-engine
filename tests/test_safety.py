@@ -37,3 +37,33 @@ def test_invalid_lease_duration(monkeypatch, value):
 def test_default_lease_duration(monkeypatch):
     monkeypatch.delenv("LEASE_SECONDS", raising=False)
     assert lease_seconds() == 60
+
+
+@pytest.mark.parametrize("configuration", ["missing", "wrong_name", "not_authorized"])
+def test_pytest_guard_aborts_before_deletion(database, configuration):
+    import os
+    import subprocess
+    import sys
+
+    from sqlalchemy import func, select
+
+    from task_engine.db import Session
+    from task_engine.models import Job
+
+    with Session.begin() as session:
+        session.add(Job(payload={"sentinel": True}))
+    environ = dict(os.environ)
+    if configuration == "missing":
+        environ.pop("TEST_DATABASE_URL", None)
+    elif configuration == "wrong_name":
+        environ["TEST_DATABASE_URL"] = "postgresql+psycopg://task@localhost/production"
+    else:
+        environ.pop("TEST_DATABASE", None)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "tests/test_engine.py::test_api_and_worker"],
+        check=False, env=environ, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 4
+    assert "Destructive tests require" in result.stderr
+    with Session() as session:
+        assert session.scalar(select(func.count()).select_from(Job)) == 1

@@ -5,7 +5,7 @@ from typing import Any
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from task_engine.db import Session
 from task_engine.models import Job
@@ -16,6 +16,7 @@ app = FastAPI()
 class JobInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     payload: dict[str, Any]
+    max_attempts: int = Field(default=3, ge=1, le=10, strict=True)
 
 
 class JobOutput(BaseModel):
@@ -23,6 +24,10 @@ class JobOutput(BaseModel):
     id: uuid.UUID
     payload: dict[str, Any]
     status: str
+    max_attempts: int
+    available_at: datetime
+    last_error_code: str | None
+    terminal_reason: str | None
     attempts: int
     created_at: datetime
     updated_at: datetime
@@ -36,7 +41,7 @@ async def invalid_input(request: Request, exc: RequestValidationError) -> JSONRe
 @app.post("/v1/jobs", status_code=201, response_model=JobOutput)
 def create_job(body: JobInput) -> Job:
     with Session.begin() as session:
-        job = Job(payload=body.payload)
+        job = Job(payload=body.payload, max_attempts=body.max_attempts)
         session.add(job)
         session.flush()
     return job

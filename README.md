@@ -1,43 +1,56 @@
-# Reliable Task Engine — phase 2A
+# Reliable Task Engine — phase 2B
 
 A small PostgreSQL-backed job queue with a FastAPI service and independent polling workers. Python 3.12 and the checked-in uv lockfile define the application environment. Handlers are synthetic and perform no external business effects.
 
 ## Quickstart
 
-Run `docker compose up --build --scale worker=2`. The migration runs before the API and workers. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -d '{"payload":{"example":1}}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects; `{"fail":true}` causes the synthetic handler to fail deterministically. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
+Run `docker compose up --build --scale worker=2` for a new installation. The migration runs before the API and workers. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -d '{"payload":{"example":1},"max_attempts":3}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects. Omitting `max_attempts` retains the default of 3. `{"fail":true}` permanently fails on its first attempt. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
 
 For local development: `uv sync --locked`; start PostgreSQL, set `DATABASE_URL` if needed, run `uv run alembic upgrade head`, then `uv run uvicorn task_engine.api:app` and `uv run python -m task_engine.worker`. Default connection is `postgresql+psycopg://task:task@localhost:5432/task`. The Compose credentials are for local development only.
 
-**Upgrading phase 1:** stop all old workers before applying migration `0002` and start only upgraded workers afterwards. Old workers perform unfenced updates and must never overlap the lease protocol. The migration gives existing `running` rows fresh tokens and already expired leases, preserving status, payload and attempts. It leaves other rows without leases. It takes a table lock; plan downtime for a large existing queue. Downgrading removes ownership protection and also requires stopping workers.
+## Upgrade and configuration
 
-## Guarantees
+**Stop all existing workers before schema migration**, including phase-2A workers; they do not honor retry eligibility or attempt limits. For an existing Compose installation, use `docker compose stop worker api`, `docker compose build`, `docker compose run --rm migrate`, then `docker compose up -d --scale worker=2`. Resume only upgraded binaries. The migration takes a table lock and updates existing rows; allow downtime and plan for table/index work on large queues. Do not use the fresh-install command to perform a rolling upgrade with old workers still running.
 
-Jobs have a UUID, JSONB object payload, constrained status (`queued`, `running`, `succeeded`, `failed`), nonnegative attempt count, timezone-aware timestamps, and nullable `lease_token` (UUID) and `lease_expires_at` (PostgreSQL TIMESTAMPTZ). `queued` is the existing API spelling for a pending job. A database constraint requires both lease fields for running jobs and neither for other states. Partial indexes cover the queued order and running lease expiry. Attempts count successful claims, including recovery claims, rather than submissions or completed handler executions.
+Migration `0003` adds `max_attempts` (positive integer, database default 3), `available_at` (TIMESTAMPTZ, database wall-time default), and nullable fixed-vocabulary `last_error_code` and `terminal_reason`. Backfill sets `available_at = created_at` and `max_attempts = greatest(3, attempts)`. Attempts, payloads, IDs, creation/update timestamps and lease metadata are preserved. Historical attempts above 3, including above 10, are supported without granting additional claims. Already exhausted queued jobs become `failed` with `attempts_exhausted`; running jobs retain their existing lease and can complete successfully while valid, or be recovered according to the new limit after expiry. Existing terminal jobs retain their status; old failed jobs receive `legacy_failure`, without inventing an error code. Migration `0002` still initializes expired leases for phase-1 running rows.
 
-Claiming uses `SELECT ... FOR UPDATE SKIP LOCKED` inside a short PostgreSQL transaction. It considers queued jobs and running jobs with expired leases, ordered by creation time and UUID. Each successful claim atomically sets running status, a new random token, a database-time expiry and an incremented attempt count. The transaction commits before the handler runs. Concurrent workers cannot acquire the same currently valid lease.
+POST accepts strict JSON integer `max_attempts` in **1..10**, including the initial attempt; booleans, strings and fractions are rejected. The database enforces positivity, not the API upper bound, to preserve legacy data. There is no API to reset attempts, raise a stored limit, or manually retry a terminal job. `LEASE_SECONDS` is a positive integer per worker, default 60. Backoff and the 100-row recovery batch are fixed implementation constants in this phase; there are no backoff environment settings. Downgrades require stopping workers/API, discard retry metadata and cannot undo terminal decisions already made.
 
-Success and failure use a separate transaction. Completion first locks the job row, then performs a conditional `UPDATE ... RETURNING` requiring the job ID, current token, running status and an expiry strictly later than PostgreSQL `clock_timestamp()`. Locking first ensures time is checked after any row-lock wait. A successful terminal transition clears both lease fields. No matching row raises `LeaseLostError`; the worker logs the discarded completion and keeps polling. Database errors propagate and terminate the worker.
+## Retry policy and status
 
-## Lease lifecycle and recovery
+Attempts count only successfully committed claims, including claims after recovery. Scheduling and recovery do not increment them. Claims start only due `queued` jobs with `attempts < max_attempts`, ordered by `available_at`, creation time and UUID. A partial index on `(available_at, created_at, id)` covers queued eligibility; the running-expiry index supports recovery. The old queued index is retained by this additive migration.
 
 | Transition | Condition | Effect |
 | --- | --- | --- |
-| `queued -> running` | First claim | New token, expiry and attempt + 1 |
-| `running -> running` | Lease expiry <= database wall time | Recovery claim with new token, expiry and attempt + 1 |
-| `running -> succeeded/failed` | Matching token and unexpired lease | Terminal status, cleared lease |
-| Completion rejected | Old/wrong token, expired lease, terminal/missing job | No state change by that completion |
+| `queued -> running` | Due and attempts below limit | Fresh token, expiry, attempts + 1 |
+| `running -> succeeded` | Successful handler and valid owner | Terminal success |
+| `running -> failed` | `PermanentJobError` and valid owner | `permanent_error`, even on attempt 1 |
+| `running -> queued` | Retryable/unexpected handler failure, attempts below limit, valid owner | Delayed eligibility |
+| `running -> failed` | Retryable/unexpected failure at limit, valid owner | `attempts_exhausted` |
+| Expired `running -> queued` | Attempts below limit | Recovery schedules delayed eligibility |
+| Expired `running -> failed` | Attempts at/above limit | `attempts_exhausted`, even if no further claim is possible |
 
-Workers poll empty queues once per second. The normal claim path recovers expired running jobs, including after a crash; there is no separate recovery service. Set `LEASE_SECONDS` to a positive integer (default `60`) in each worker environment; Compose forwards the same setting. Lease comparisons and expiry assignment use database wall time rather than worker clocks or transaction-start time. The lease starts at the claim update, so commit latency also consumes its duration.
+`RetryableJobError` explicitly requests retry. `PermanentJobError` also subclasses `ValueError`, preserving the synthetic handler contract. Other ordinary handler exceptions are classified as `unexpected_error` and retried within the limit. `KeyboardInterrupt` and `SystemExit` propagate, leaving the running lease for recovery. Database failures propagate and stop the worker. Logs contain job IDs and fixed classification codes, without handler exception messages, stack traces or payloads.
 
-There is **no heartbeat**. A slow or paused handler can outlive its lease and overlap a new handler after recovery. Expiry prevents even the original owner from completing before any reclaim has happened. Completion validity is checked when the locked conditional update executes; it does not promise that commit finishes before the deadline. Creation timestamps still use PostgreSQL transaction time and do not establish a globally ordered event sequence.
+Backoff after failed attempt **n** is `min(60, 2 * 2**(n-1))` seconds: 2, 4, 8, 16, 32, 60, 60, … . It starts at the database-time failure/recovery update, rather than at the old lease expiry; delayed recovery therefore starts a fresh delay. No random jitter is applied, so synchronized failures may produce retry bursts. No transaction sleeps or waits through backoff. Other ready jobs can proceed.
 
-## Non-guarantees and at-least-once boundary
+POST/GET return `max_attempts`, `attempts`, `available_at`, `last_error_code` and `terminal_reason` alongside the previous response fields. `queued` with a future `available_at` means waiting for retry eligibility; there is no new status spelling. `last_error_code` is one of `retryable_error`, `permanent_error`, `unexpected_error`, `lease_expired` (or null); it retains the latest failure even after later success. `terminal_reason` is `permanent_error`, `attempts_exhausted`, or `legacy_failure` for failed jobs and null otherwise. `available_at` is meaningful for queued eligibility, not a completion timestamp or a promise of immediate execution.
 
-This is an at-least-once execution design under continued polling and database availability, **not exactly-once execution**. A crash after an external effect but before completion, or lease expiry during a handler, can cause duplicate effects. The random UUID fences job-state changes in PostgreSQL only. It is not a monotonically increasing fencing number understood by an external system. The attempt count is the per-job generation; this phase does not pass it to external systems or enforce it there.
+## Ownership and crash recovery
 
-There is no bounded retry policy, max-attempt limit, retry backoff or idempotency-key support yet. Handler exceptions produce terminal `failed` jobs when the lease is valid; failed jobs are not automatically retried. Repeated crashes or lease expiry can cause unbounded recovery claims. Recovery depends on workers and PostgreSQL being available, and strict fairness or prompt completion is not guaranteed. Database clock jumps can affect lease duration. No authentication, rate limiting, payload size policy, retention or production deployment hardening is provided. Do not expose this service to untrusted networks.
+Claiming uses `FOR UPDATE SKIP LOCKED` in a short transaction and commits before handler execution. Every worker completion/retry locks the row before testing PostgreSQL `clock_timestamp()`, then updates conditionally on ID, token, running status and strictly unexpired lease. Rejected updates raise `LeaseLostError` and change nothing. Every transition out of running clears both lease fields. A database constraint enforces the running/lease relationship. Expiry is evaluated after lock acquisition, not at transaction start; commit latency still consumes the lease and validity at commit is not promised.
 
-See [ADR 0001](docs/adr/0001-leases-and-fencing.md) for the ownership and transaction decisions.
+Each poll first recovers up to 100 expired running rows with `FOR UPDATE SKIP LOCKED`, rechecking expiry after locking and atomically scheduling retry or terminal failure. Recovery commits independently before looking for a new claim, so exhaustion cannot strand an expired job. Concurrent recovery and completion serialize on the row lock. Old tokens cannot write success, permanent failure or retry after recovery. Recovery does not re-execute handlers directly. Workers sleep one second outside transactions when no job is claimable. Continued polling drains larger recovery backlogs without a separate service; locked rows can be skipped until a later poll.
+
+There is **no heartbeat**. A paused or slow handler can outlive its lease and overlap a later execution. Lease timestamps and eligibility use database wall time; clock jumps affect timing. Creation timestamps still use transaction time and do not establish a global event sequence.
+
+## At-least-once boundary and limitations
+
+The engine follows an **at-least-once execution design with a finite attempt budget**, under continued polling and database availability. It does not promise exactly-once execution, eventual success, or even handler invocation for every committed claim: a worker can crash immediately after claiming and consume an attempt. Terminal failures are not automatically reopened.
+
+A crash after an external effect but before completion, or expiry during execution, can duplicate effects. UUID tokens fence PostgreSQL job-state updates only; external systems do not enforce these tokens or attempt generations. Before adding real external effects, define downstream idempotency and a transactional delivery protocol. Bounded retries do not make effects exactly-once.
+
+There is no jitter, heartbeat, cancellation, failure history, authentication, rate limiting, payload-size policy, retention or production hardening. Strict fairness and prompt completion are not guaranteed. Do not expose this service to untrusted networks. See [ADR 0001](docs/adr/0001-leases-and-fencing.md) and [ADR 0002](docs/adr/0002-bounded-retries.md).
 
 ## Validation
 
@@ -59,6 +72,6 @@ docker compose config -q
 docker rm --force rte-test-db
 ```
 
-Integration coverage includes eight-process initial and recovery claiming, committed ownership before handler execution, deterministic expiry by database updates, stale and expired success/failure rejection, valid completion, terminal exclusion, lost-lease worker behavior, and migration of existing phase-1 rows. Configuration tests exercise the destructive-test guard. See the [local validation record](docs/phase-2a-validation.md) for executed checks and remaining limits. GitHub Actions is configured; no successful CI run is claimed here.
+Integration coverage includes eight-process initial and scheduled recovery claims, bounded classified failures, success after retries, permanent failure, retry eligibility without sleeps, recovery exhaustion, stale success/failure/retry rejection, completion/recovery races, migration from 0001/0002 with legacy attempts above 3/10, and destructive-configuration rejection before deletion. See the [phase-2B validation record](docs/phase-2b-validation.md). GitHub Actions is configured; no successful remote CI run is claimed.
 
-Phase 2B should define bounded retries, backoff and failure classification, followed by idempotency keys and a concrete strategy for external side effects. Heartbeats and cancellation require a separate explicit protocol if long handlers are needed.
+Phase 2C candidates: submission idempotency keys with concurrent duplicate-request tests; a downstream idempotency/outbox protocol before external effects; operational retry/failure metrics. Jitter, heartbeat and cancellation need explicit follow-up semantics.

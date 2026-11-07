@@ -72,3 +72,31 @@ def test_upgrade_preserves_legacy_jobs_and_recovers_running(database, start):
                                     "VALUES (gen_random_uuid(),'{}','queued',0,0)"))
     finally:
         command.upgrade(config, "head")
+
+
+def test_0004_preserves_every_existing_column(database):
+    config = Config('alembic.ini')
+    command.downgrade(config, '0003')
+    try:
+        with engine.begin() as connection:
+            for status in ('queued', 'running', 'succeeded', 'failed'):
+                connection.execute(text(
+                    "INSERT INTO jobs (id,payload,status,attempts,max_attempts,lease_token,"
+                    "lease_expires_at,last_error_code,terminal_reason) VALUES "
+                    "(gen_random_uuid(),CAST(:payload AS jsonb),CAST(:status AS varchar),2,4,"
+                    "CASE WHEN :status = 'running' THEN gen_random_uuid() END,"
+                    "CASE WHEN :status = 'running' THEN clock_timestamp() END,"
+                    "'retryable_error',CASE WHEN :status = 'failed' THEN 'attempts_exhausted' END)"
+                ), {'status': status, 'payload': '{"legacy":true}'})
+            before = {row.id: dict(row._mapping)
+                      for row in connection.execute(text('SELECT * FROM jobs'))}
+        command.upgrade(config, '0004')
+        with engine.connect() as connection:
+            after = {row.id: dict(row._mapping)
+                     for row in connection.execute(text('SELECT * FROM jobs'))}
+        assert before.keys() == after.keys()
+        for job_id, values in after.items():
+            assert values.pop('idempotency_key') is None
+            assert values == before[job_id]
+    finally:
+        command.upgrade(config, 'head')

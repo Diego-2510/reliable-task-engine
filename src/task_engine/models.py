@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, Integer, String, func
+from sqlalchemy import CheckConstraint, DateTime, Index, Integer, String, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -28,6 +28,7 @@ class Job(Base):
             name="ck_jobs_lease_state",
         ),
     )
+    idempotency_key: Mapped[str | None] = mapped_column(String(128), nullable=True)
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="queued")
@@ -42,3 +43,9 @@ class Job(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+Index(
+    "ix_jobs_idempotency_key", Job.idempotency_key, unique=True,
+    postgresql_where=Job.idempotency_key.is_not(None),
+)

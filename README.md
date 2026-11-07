@@ -1,4 +1,4 @@
-# Reliable Task Engine — phase 2B
+# Reliable Task Engine — phase 2C
 
 A small PostgreSQL-backed job queue with a FastAPI service and independent polling workers. Python 3.12 and the checked-in uv lockfile define the application environment. Handlers are synthetic and perform no external business effects.
 
@@ -15,6 +15,29 @@ For local development: `uv sync --locked`; start PostgreSQL, set `DATABASE_URL` 
 Migration `0003` adds `max_attempts` (positive integer, database default 3), `available_at` (TIMESTAMPTZ, database wall-time default), and nullable fixed-vocabulary `last_error_code` and `terminal_reason`. Backfill sets `available_at = created_at` and `max_attempts = greatest(3, attempts)`. Attempts, payloads, IDs, creation/update timestamps and lease metadata are preserved. Historical attempts above 3, including above 10, are supported without granting additional claims. Already exhausted queued jobs become `failed` with `attempts_exhausted`; running jobs retain their existing lease and can complete successfully while valid, or be recovered according to the new limit after expiry. Existing terminal jobs retain their status; old failed jobs receive `legacy_failure`, without inventing an error code. Migration `0002` still initializes expired leases for phase-1 running rows.
 
 POST accepts strict JSON integer `max_attempts` in **1..10**, including the initial attempt; booleans, strings and fractions are rejected. The database enforces positivity, not the API upper bound, to preserve legacy data. There is no API to reset attempts, raise a stored limit, or manually retry a terminal job. `LEASE_SECONDS` is a positive integer per worker, default 60. Backoff and the 100-row recovery batch are fixed implementation constants in this phase; there are no backoff environment settings. Downgrades require stopping workers/API, discard retry metadata and cannot undo terminal decisions already made.
+
+## Submission idempotency
+
+`POST /v1/jobs` accepts an optional `Idempotency-Key` header. Without it, every valid submission creates a new job with **201 Created**. A new key also returns **201**. Reusing a key with the same JSONB payload and `max_attempts` returns **200 OK**, the same job ID, and its current state, including running or terminal state. Omitting `max_attempts` equals explicitly sending its default of 3. Nested JSON object key order is ignored; array order and JSON types remain significant. Equality follows PostgreSQL JSONB semantics (for example, `1` and `1.0` compare equal).
+
+```sh
+# First call: 201. Repeat this call: 200, same ID and current state.
+curl -i localhost:8000/v1/jobs \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: order-123' \
+  -d '{"payload":{"example":1},"max_attempts":3}'
+# Same key, different parameters: 409.
+curl -i localhost:8000/v1/jobs \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: order-123' \
+  -d '{"payload":{"example":2},"max_attempts":3}'
+```
+
+A mismatch in payload or `max_attempts` returns **409 Conflict** with `{"error":{"code":"idempotency_conflict","message":"Job parameters differ from the original submission"}}`. Keys must contain 1–128 printable ASCII characters excluding spaces (`!` through `~`); empty, repeated, non-ASCII, whitespace or control-containing headers return **422** with the existing `invalid_input` error. Keys are case-sensitive opaque values; they are not trimmed. Keys are excluded from responses and application logs/errors. Database failures return **500** with a fixed `database_error` response, never a successful replay or a conflict. Infrastructure outside this application must also avoid logging request headers and database diagnostics containing keys.
+
+Migration `0004` adds nullable `jobs.idempotency_key` and a unique partial index for non-null keys. All existing rows receive NULL; no existing job fields are updated. Stop API/workers for migration as described above and allow time for the table lock and index creation. Downgrading to `0003` discards key associations; replay guarantees cannot survive that downgrade.
+
+One short **READ COMMITTED** transaction executes `INSERT ... ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING ...`. PostgreSQL serializes competing inserts through the unique index. A loser reads the existing job and compares JSONB/attempt limit in a **separate SELECT**, whose fresh snapshot sees the committed winner. Only the targeted key conflict is ignored; other database failures propagate to the fixed 500 handler. Commit completes before returning success. Replays do not update timestamps, status, leases or attempts. There are no application locks or caches. Eight concurrent identical submissions create one job (one 201, seven 200); differing submissions yield one 201 and conflicts for parameters that differ from the winner. Different keys may proceed independently. Associations persist across API restarts.
+
+Keys are **global in this MVP**, because there is no user/tenant isolation. There is **no automatic key expiration**; retention is a future design problem. Deleting jobs deletes their key associations. Submission idempotency prevents duplicate logical jobs, not duplicate external side effects. There is **no exactly-once execution guarantee**. Without authentication this API is **not suitable for public production deployment**. See [ADR 0003](docs/adr/0003-submission-idempotency.md).
 
 ## Retry policy and status
 
@@ -54,6 +77,8 @@ There is no jitter, heartbeat, cancellation, failure history, authentication, ra
 
 ## Validation
 
+Phase-2C integration coverage additionally includes eight fresh API processes submitting identical/conflicting requests, independent keys, process restart persistence, terminal/running replays, header validation, real database failures and exact preservation of all existing columns during `0003 → 0004`.
+
 Tests **delete every row in `jobs`**; the migration test also downgrades and upgrades the test schema. Use a dedicated disposable PostgreSQL database. Never point these commands at development or production data. Tests require both `TEST_DATABASE=1` and an explicit `TEST_DATABASE_URL`, with driver `postgresql+psycopg`, a host, no URL query overrides, and a database name ending in `_test`. Missing or unsafe configuration aborts pytest before application import, without falling back to `DATABASE_URL`. The fixture also verifies the actual database name before deletion. The name check cannot prove that a database is disposable; setting these variables explicitly authorizes destruction of that database. Do not run workers or another test suite against it concurrently.
 
 For example, start a fresh container without persistent storage (choose a free port):
@@ -74,4 +99,4 @@ docker rm --force rte-test-db
 
 Integration coverage includes eight-process initial and scheduled recovery claims, bounded classified failures, success after retries, permanent failure, retry eligibility without sleeps, recovery exhaustion, stale success/failure/retry rejection, completion/recovery races, migration from 0001/0002 with legacy attempts above 3/10, and destructive-configuration rejection before deletion. See the [phase-2B validation record](docs/phase-2b-validation.md). GitHub Actions is configured; no successful remote CI run is claimed.
 
-Phase 2C candidates: submission idempotency keys with concurrent duplicate-request tests; a downstream idempotency/outbox protocol before external effects; operational retry/failure metrics. Jitter, heartbeat and cancellation need explicit follow-up semantics.
+Next steps: a downstream idempotency/outbox protocol before external effects; operational retry/failure metrics. Jitter, heartbeat and cancellation need explicit follow-up semantics.

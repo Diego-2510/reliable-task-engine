@@ -247,7 +247,7 @@ def test_expired_retry_rejected_before_recovery(database, error):
 def test_database_failure_propagates(database, monkeypatch):
     add_job()
 
-    def broken_completion(*args):
+    def broken_completion(*args, **kwargs):
         raise RuntimeError("database unavailable")
 
     monkeypatch.setattr(worker, "complete", broken_completion)

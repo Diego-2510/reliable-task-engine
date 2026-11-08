@@ -100,3 +100,57 @@ def test_0004_preserves_every_existing_column(database):
             assert values == before[job_id]
     finally:
         command.upgrade(config, 'head')
+
+
+def test_0005_upgrade_and_downgrade_preserve_jobs(database):
+    config = Config("alembic.ini")
+    command.downgrade(config, "0004")
+    try:
+        with engine.begin() as connection:
+            for status in ("queued", "running", "succeeded", "failed"):
+                for attempts in (0, 2, 12):
+                    connection.execute(text(
+                        "INSERT INTO jobs (id,payload,status,attempts,max_attempts,idempotency_key,"
+                        "created_at,updated_at,available_at,lease_token,lease_expires_at,"
+                        "last_error_code,terminal_reason) VALUES "
+                        "(:id,CAST(:payload AS jsonb),CAST(:status AS varchar),:attempts,14,:key,"
+                        "clock_timestamp() - interval '3 days',"
+                        "clock_timestamp() - interval '2 days',"
+                        "clock_timestamp() - interval '1 day',"
+                        "CASE WHEN :status = 'running' THEN gen_random_uuid() END,"
+                        "CASE WHEN :status = 'running' THEN clock_timestamp() + interval '1 hour' END,"
+                        "'retryable_error',CASE WHEN :status = 'failed' THEN 'attempts_exhausted' END)"
+                    ), {"id": uuid.uuid4(), "status": status, "attempts": attempts,
+                        "payload": '{"emit_outbox_event":true}',
+                        "key": f"legacy-{status}-{attempts}" if attempts else None})
+            before = [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM jobs ORDER BY id"),
+            )]
+            indexes_before = connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'jobs' ORDER BY indexname"
+            )).all()
+        command.upgrade(config, "0005")
+        with engine.begin() as connection:
+            assert [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM jobs ORDER BY id"),
+            )] == before
+            assert connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'jobs' ORDER BY indexname"
+            )).all() == indexes_before
+            assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 0
+            connection.execute(text(
+                "INSERT INTO outbox_events (id,job_id,event_type,payload) VALUES "
+                "(gen_random_uuid(),:id,'job.succeeded.v1',jsonb_build_object("
+                "'job_id',CAST(:id AS text),'event_version',1))"
+            ), {"id": next(row["id"] for row in before if row["status"] == "succeeded")})
+        command.downgrade(config, "0004")
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT to_regclass('outbox_events')")) is None
+            assert [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM jobs ORDER BY id"),
+            )] == before
+            assert connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename = 'jobs' ORDER BY indexname"
+            )).all() == indexes_before
+    finally:
+        command.upgrade(config, "head")

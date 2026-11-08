@@ -3,15 +3,20 @@ import os
 import time
 import uuid
 from datetime import timedelta
+from enum import Enum
 from typing import Literal
 
 from sqlalchemy import func, select, update
 
 from task_engine.db import Session
-from task_engine.models import Job
+from task_engine.models import Job, OutboxEvent
 
 log = logging.getLogger(__name__)
 ErrorCode = Literal["retryable_error", "permanent_error", "unexpected_error"]
+
+
+class SyntheticEventIntent(Enum):
+    JOB_SUCCEEDED = "job.succeeded.v1"
 
 
 class LeaseLostError(RuntimeError):
@@ -40,10 +45,13 @@ def backoff_seconds(attempts: int) -> int:
     return min(60, 2 << min(attempts - 1, 5))
 
 
-def handle(payload: dict[str, object]) -> None:
-    """Deterministic synthetic handler; {"fail": true} is permanently invalid."""
+def handle(payload: dict[str, object]) -> SyntheticEventIntent | None:
+    """Synthetic only: return an optional intent after successful processing."""
     if payload.get("fail") is True:
         raise PermanentJobError("synthetic failure")
+    if payload.get("emit_outbox_event") is True:
+        return SyntheticEventIntent.JOB_SUCCEEDED
+    return None
 
 
 def recover_expired() -> int:
@@ -112,7 +120,10 @@ def claim() -> tuple[uuid.UUID, uuid.UUID, dict[str, object]] | None:
     return claimed
 
 
-def _finish(job_id: uuid.UUID, token: uuid.UUID, code: ErrorCode | None) -> None:
+def _finish(
+    job_id: uuid.UUID, token: uuid.UUID, code: ErrorCode | None,
+    event_intent: SyntheticEventIntent | None = None,
+) -> None:
     with Session.begin() as session:
         # Lock BEFORE testing PostgreSQL expiry, including after a lock wait.
         job = session.scalar(select(Job).where(Job.id == job_id).with_for_update())
@@ -142,13 +153,25 @@ def _finish(job_id: uuid.UUID, token: uuid.UUID, code: ErrorCode | None) -> None
         )
         if completed is None:
             raise LeaseLostError(f"Lease lost for job {job_id}")
+        if code is None and event_intent is SyntheticEventIntent.JOB_SUCCEEDED:
+            session.add(OutboxEvent(
+                job_id=job_id, event_type=event_intent.value,
+                payload={"job_id": str(job_id), "event_version": 1},
+            ))
+            # Insert errors propagate and abort BOTH writes; there is one commit.
+            session.flush()
 
 
-def complete(job_id: uuid.UUID, token: uuid.UUID, status: Literal["succeeded", "failed"]) -> None:
+def complete(
+    job_id: uuid.UUID, token: uuid.UUID, status: Literal["succeeded", "failed"], *,
+    event_intent: SyntheticEventIntent | None = None,
+) -> None:
     """Compatibility entry point; explicit failed completion is permanent."""
     if status not in ("succeeded", "failed"):
         raise ValueError("Completion requires a terminal status")
-    _finish(job_id, token, None if status == "succeeded" else "permanent_error")
+    if event_intent is not None and status != "succeeded":
+        raise ValueError("Event intent requires successful completion")
+    _finish(job_id, token, None if status == "succeeded" else "permanent_error", event_intent)
 
 
 def fail(job_id: uuid.UUID, token: uuid.UUID, error: Exception) -> None:
@@ -171,12 +194,12 @@ def run_once() -> bool:
     status = "succeeded"
     try:
         try:
-            handle(payload)
+            event_intent = handle(payload)
         except Exception as error:  # noqa: BLE001 - bound unknown handler failures; never log text
             status = "failed"
             fail(job_id, token, error)
         else:
-            complete(job_id, token, "succeeded")
+            complete(job_id, token, "succeeded", event_intent=event_intent)
     except LeaseLostError:
         log.warning("Lease lost for job %s; discarded %s completion", job_id, status)
     return True

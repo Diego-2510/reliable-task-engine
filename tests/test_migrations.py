@@ -154,3 +154,110 @@ def test_0005_upgrade_and_downgrade_preserve_jobs(database):
             )).all() == indexes_before
     finally:
         command.upgrade(config, "head")
+
+
+def test_0006_preserves_all_jobs_and_existing_outbox_data(database):
+    config = Config("alembic.ini")
+    command.downgrade(config, "0005")
+    try:
+        with engine.begin() as connection:
+            for status in ("queued", "running", "succeeded", "failed"):
+                for attempts in (0, 2, 12):
+                    job_id = uuid.uuid4()
+                    connection.execute(text(
+                        "INSERT INTO jobs (id,payload,status,attempts,max_attempts,idempotency_key,"
+                        "created_at,updated_at,available_at,lease_token,lease_expires_at,"
+                        "last_error_code,terminal_reason) VALUES "
+                        "(:id,CAST(:payload AS jsonb),CAST(:status AS varchar),:attempts,14,:key,"
+                        "clock_timestamp() - interval '3 days',"
+                        "clock_timestamp() - interval '2 days',"
+                        "clock_timestamp() - interval '1 day',"
+                        "CASE WHEN :status = 'running' THEN gen_random_uuid() END,"
+                        "CASE WHEN :status = 'running' THEN clock_timestamp() + interval '1 hour' END,"
+                        "'retryable_error',CASE WHEN :status = 'failed' THEN 'attempts_exhausted' END)"
+                    ), {"id": job_id, "status": status, "attempts": attempts,
+                        "payload": '{"legacy":{"keep":[1,true,null]}}',
+                        "key": f"legacy-{status}-{attempts}" if attempts else None})
+                    if status == "succeeded":
+                        connection.execute(text(
+                            "INSERT INTO outbox_events (id,job_id,event_type,payload,created_at) "
+                            "VALUES (:id,:job_id,'job.succeeded.v1',CAST(:payload AS jsonb),"
+                            "clock_timestamp() - interval '2 days')"
+                        ), {"id": uuid.uuid4(), "job_id": job_id,
+                            "payload": '{"legacy":{"keep":[1,true,null]}}'})
+            jobs_before = [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM jobs ORDER BY id"),
+            )]
+            events_before = [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM outbox_events ORDER BY id"),
+            )]
+            indexes_before = connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename IN ('jobs','outbox_events') "
+                "ORDER BY indexname"
+            )).all()
+        earliest = None
+        with engine.connect() as connection:
+            earliest = connection.scalar(select(func.clock_timestamp()))
+        command.upgrade(config, "0006")
+        with engine.connect() as connection:
+            latest = connection.scalar(select(func.clock_timestamp()))
+            assert [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM jobs ORDER BY id"),
+            )] == jobs_before
+            events_after = [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM outbox_events ORDER BY id"),
+            )]
+            assert len(events_after) == len(events_before) == 3
+            for old, new in zip(events_before, events_after, strict=True):
+                assert new.pop("delivery_state") == "pending"
+                assert new.pop("delivery_attempts") == 0
+                assert earliest <= new.pop("next_attempt_at") <= latest
+                assert new.pop("delivery_token") is None
+                assert new.pop("delivery_lease_expires_at") is None
+                assert new.pop("delivered_at") is None
+                assert new == old
+            assert connection.scalar(text("SELECT count(*) FROM synthetic_receiver_events")) == 0
+            indexes_after = connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename IN ('jobs','outbox_events') "
+                "ORDER BY indexname"
+            )).all()
+            assert set(indexes_before).issubset(set(indexes_after))
+            delivery_indexes = [row[0] for row in indexes_after if "ix_outbox_" in row[0]]
+            assert len(delivery_indexes) == 2
+            assert any("next_attempt_at, created_at, id" in value and "pending" in value
+                       for value in delivery_indexes)
+            assert any("delivery_lease_expires_at, id" in value and "delivering" in value
+                       for value in delivery_indexes)
+        # Populate all delivery states and receiver data before testing the downgrade.
+        from task_engine.dispatcher import (
+            acknowledge_delivery,
+            claim_delivery,
+            deliver_to_synthetic_receiver,
+        )
+        first = claim_delivery()
+        deliver_to_synthetic_receiver(first)
+        acknowledge_delivery(first.event_id, first.token)
+        second = claim_delivery()
+        assert second is not None
+        command.downgrade(config, "0005")
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT to_regclass('synthetic_receiver_events')")) is None
+            assert [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM jobs ORDER BY id"),
+            )] == jobs_before
+            assert [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM outbox_events ORDER BY id"),
+            )] == events_before
+            assert connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename IN ('jobs','outbox_events') "
+                "ORDER BY indexname"
+            )).all() == indexes_before
+        command.upgrade(config, "0006")
+        with engine.connect() as connection:
+            assert connection.scalar(text(
+                "SELECT count(*) FROM outbox_events WHERE delivery_state = 'pending' "
+                "AND delivery_attempts = 0"
+            )) == 3
+            assert connection.scalar(text("SELECT count(*) FROM synthetic_receiver_events")) == 0
+    finally:
+        command.upgrade(config, "head")

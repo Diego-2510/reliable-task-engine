@@ -61,17 +61,71 @@ Index(
 
 
 class OutboxEvent(Base):
-    """Durable intent; id is the stable deduplication key for future deliveries."""
+    """Durable intent; id remains the deduplication key across delivery claims."""
 
     __tablename__ = "outbox_events"
     __table_args__ = (
         UniqueConstraint("job_id", "event_type", name="uq_outbox_job_event_type"),
         CheckConstraint("event_type = 'job.succeeded.v1'", name="ck_outbox_event_type"),
+        CheckConstraint(
+            "delivery_state IN ('pending', 'delivering', 'delivered')",
+            name="ck_outbox_delivery_state",
+        ),
+        CheckConstraint("delivery_attempts >= 0", name="ck_outbox_delivery_attempts"),
+        CheckConstraint(
+            "(delivery_state = 'delivering' AND delivery_token IS NOT NULL "
+            "AND delivery_lease_expires_at IS NOT NULL) OR "
+            "(delivery_state <> 'delivering' AND delivery_token IS NULL "
+            "AND delivery_lease_expires_at IS NULL)",
+            name="ck_outbox_delivery_lease",
+        ),
+        CheckConstraint(
+            "(delivery_state = 'delivered' AND delivered_at IS NOT NULL) OR "
+            "(delivery_state <> 'delivered' AND delivered_at IS NULL)",
+            name="ck_outbox_delivered_at",
+        ),
     )
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     job_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("jobs.id"), nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, object]] = mapped_column(JSONB, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp(),
+    )
+    delivery_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="pending",
+    )
+    delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp(),
+    )
+    delivery_token: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    delivery_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+Index(
+    "ix_outbox_pending_due", OutboxEvent.next_attempt_at, OutboxEvent.created_at, OutboxEvent.id,
+    postgresql_where=OutboxEvent.delivery_state == "pending",
+)
+Index(
+    "ix_outbox_delivery_expiry", OutboxEvent.delivery_lease_expires_at, OutboxEvent.id,
+    postgresql_where=OutboxEvent.delivery_state == "delivering",
+)
+
+
+class SyntheticReceiverEvent(Base):
+    """The receiver effect is its deduplicated row, committed independently."""
+
+    __tablename__ = "synthetic_receiver_events"
+    __table_args__ = (
+        CheckConstraint("event_type = 'job.succeeded.v1'", name="ck_receiver_event_type"),
+    )
+    event_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False)
+    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    processed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp(),
     )

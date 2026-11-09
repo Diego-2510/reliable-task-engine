@@ -1,4 +1,4 @@
-# Reliable Task Engine — phase 2D-1
+# Reliable Task Engine — phase 2D-2
 
 A small PostgreSQL-backed job queue with a FastAPI service and independent polling workers. Python 3.12 and the checked-in uv lockfile define the application environment. Handlers are synthetic and perform no external business effects.
 
@@ -6,11 +6,11 @@ A small PostgreSQL-backed job queue with a FastAPI service and independent polli
 
 Run `docker compose up --build --scale worker=2` for a new installation. The migration runs before the API and workers. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -d '{"payload":{"example":1},"max_attempts":3}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects. Omitting `max_attempts` retains the default of 3. `{"fail":true}` permanently fails on its first attempt. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
 
-For local development: `uv sync --locked`; start PostgreSQL, set `DATABASE_URL` if needed, run `uv run alembic upgrade head`, then `uv run uvicorn task_engine.api:app` and `uv run python -m task_engine.worker`. Default connection is `postgresql+psycopg://task:task@localhost:5432/task`. The Compose credentials are for local development only.
+For local development: `uv sync --locked`; start PostgreSQL, set `DATABASE_URL` if needed, run `uv run alembic upgrade head`, then `uv run uvicorn task_engine.api:app`, `uv run python -m task_engine.worker` and, in a separate process, `uv run python -m task_engine.dispatcher`. Default connection is `postgresql+psycopg://task:task@localhost:5432/task`. The Compose credentials are for local development only.
 
 ## Upgrade and configuration
 
-**Stop all existing workers and API instances before schema migration**, including phase-2A workers; they do not honor retry eligibility or attempt limits. Older workers also cannot enqueue outbox intents. For an existing Compose installation, use `docker compose stop worker api`, `docker compose build`, `docker compose run --rm migrate`, then `docker compose up -d --scale worker=2`. Resume only upgraded binaries. Earlier migrations take a table lock and update existing rows; allow downtime and plan for table/index work on large queues. Do not use the fresh-install command to perform a rolling upgrade with old workers still running.
+**Stop all existing workers, API instances and dispatchers before schema migration**, including phase-2A workers; they do not honor retry eligibility or attempt limits. Older workers also cannot enqueue outbox intents. Stop locally started dispatchers separately. For an existing Compose installation, use `docker compose stop worker api`, `docker compose build`, `docker compose run --rm migrate`, then `docker compose up -d --scale worker=2`. Resume only upgraded binaries. Earlier migrations take a table lock and update existing rows; allow downtime and plan for table/index work on large queues. Do not use the fresh-install command to perform a rolling upgrade with old workers still running.
 
 Migration `0003` adds `max_attempts` (positive integer, database default 3), `available_at` (TIMESTAMPTZ, database wall-time default), and nullable fixed-vocabulary `last_error_code` and `terminal_reason`. Backfill sets `available_at = created_at` and `max_attempts = greatest(3, attempts)`. Attempts, payloads, IDs, creation/update timestamps and lease metadata are preserved. Historical attempts above 3, including above 10, are supported without granting additional claims. Already exhausted queued jobs become `failed` with `attempts_exhausted`; running jobs retain their existing lease and can complete successfully while valid, or be recovered according to the new limit after expiry. Existing terminal jobs retain their status; old failed jobs receive `legacy_failure`, without inventing an error code. Migration `0002` still initializes expired leases for phase-1 running rows.
 
@@ -47,7 +47,35 @@ Completion first locks the job row, then requires the current token, running sta
 
 Migration `0005` only adds `outbox_events`: UUID `id`, FK `job_id`, fixed `event_type`, JSONB `payload`, and TIMESTAMPTZ `created_at`. A unique constraint on `(job_id, event_type)` permits at most one success event per job. The committed event UUID is the stable future downstream deduplication key; retries of delivery must retain it. No historical jobs are backfilled or changed. Stop old workers/API before upgrading. Downgrade to `0004` drops only this table and permanently discards its events/identifiers. The FK prevents deleting referenced jobs; a future retention policy must coordinate jobs and events.
 
-This phase implements **durable enqueueing only**: no dispatcher, delivery attempts, delivered marker or outbox API. It makes no exactly-once-delivery or production-integration claim. A later dispatcher must deliver **at least once**, retaining event IDs, and recipients must deduplicate those IDs alongside their effects. See [ADR 0004](docs/adr/0004-transactional-outbox.md).
+Phase 2D-2 adds a separate dispatcher and synthetic receiver to this durable intent. There is no public outbox API or exactly-once-delivery guarantee. See [ADR 0004](docs/adr/0004-transactional-outbox.md) for enqueueing and [ADR 0005](docs/adr/0005-outbox-dispatcher.md) for delivery.
+
+## Outbox delivery and synthetic receiver
+
+Start the dispatcher after `uv run alembic upgrade head`:
+
+```sh
+uv run python -m task_engine.dispatcher
+# Optional independent lease configuration (positive integer seconds; default 60):
+DELIVERY_LEASE_SECONDS=120 uv run python -m task_engine.dispatcher
+```
+
+Multiple dispatcher processes can poll concurrently. The dispatcher uses three short, separately committed transactions:
+
+1. **Claim:** `FOR UPDATE SKIP LOCKED` selects a due `pending` event or an expired `delivering` lease. An atomic update assigns a fresh token and lease, increments `delivery_attempts`, and commits before receiver invocation.
+2. **Receive:** a new transaction inserts the allowlisted event ID, job ID and fixed event type into `synthetic_receiver_events`. The event-ID primary key and `ON CONFLICT DO NOTHING` durably deduplicate repeated delivery. The original `processed_at` remains unchanged; duplicates are accepted as success. No JSON payload, submission key, destination or secret is copied.
+3. **Ack:** another transaction locks the outbox row, checks delivering state, current token and a strictly unexpired lease using PostgreSQL `clock_timestamp()`, then sets `delivered` and DB-time `delivered_at` and clears both lease fields. Delivered events are never reclaimed.
+
+The persisted outbox UUID is the **stable Event ID**, unchanged across claims, crashes and redelivery. Ownership tokens change with every claim. Expired senders cannot ack or schedule retry, including after a newer claim. Fencing checks happen after lock acquisition and at the locked update, not at commit. No transaction spans receiver execution or backoff waiting.
+
+A temporary `RetryableDeliveryError` schedules a fenced transition to pending with `next_attempt_at` based on PostgreSQL wall time and capped exponential delays of 2, 4, 8, 16, 32, 60, 60, … seconds. Only claims increment attempts. There is **no configured maximum delivery-attempt limit and no dead-letter policy**; permanently failing events can consume resources indefinitely. Tests inject synthetic temporary errors; job payloads cannot request delivery failures. Unexpected errors propagate; database errors stop the CLI with exit code 1 and a fixed diagnostic without database/exception details. Uncertain COMMIT outcomes are errors, never confirmed successes. An uncertain receiver commit does not trigger ack.
+
+A crash **after receiver commit but before outbox ack** leaves delivering state and a stored receiver effect. After lease expiry, a new owner redelivers the same event ID, the receiver accepts the duplicate without another stored effect, and the new owner acknowledges. A crash before receiver commit instead allows a later first effect. An ack failure cannot roll back the separately committed receiver row. Reconnect and inspect durable state to resolve uncertain commits; continued polling handles eligible leases.
+
+The synthetic receiver uses **the same PostgreSQL instance in separate transactions**. It simulates an external reception boundary; it is **not evidence of real HTTP/network delivery**, separate-service availability, or a distributed transaction. Its row is the entire synthetic effect, and it has no foreign keys to sender tables. No real network delivery or external business effect is implemented.
+
+Migration `0006` initializes all `0005` events as due pending, attempts zero, with no lease/delivered metadata. Existing IDs, payloads, `created_at` and jobs are preserved. State/lease/timestamp checks and partial due/expiry indexes protect the protocol. Stop API/workers/dispatchers before migration; allow table locks, check validation and index work. Downgrade to `0005` preserves original outbox/jobs data but destroys delivery state and receiver deduplication. Re-upgrade therefore re-enables delivery of every retained event and can repeat effects.
+
+**Non-guarantees:** no exactly-once delivery, eventual success, guaranteed receiver invocation for every claim, ordering, strict fairness, bounded latency, heartbeat, jitter, dead-letter handling, retention or production readiness. Continued polling and database/receiver availability are prerequisites for progress. Paused senders can overlap after expiry; DB wall-clock jumps affect leases. Receiver-ID deletion loses deduplication, so future retention must account for replay horizons. The worker's finite job-attempt budget remains separate from delivery retries.
 
 ## Retry policy and status
 
@@ -89,7 +117,7 @@ There is no jitter, heartbeat, cancellation, failure history, authentication, ra
 
 Phase-2C integration coverage additionally includes eight fresh API processes submitting identical/conflicting requests, independent keys, process restart persistence, terminal/running replays, header validation, real database failures and exact preservation of all existing columns during `0003 → 0004`.
 
-Tests **delete every row in `outbox_events` and `jobs`**; migration tests also downgrade and upgrade the test schema. Use a dedicated disposable PostgreSQL database. Never point these commands at development or production data. Tests require both `TEST_DATABASE=1` and an explicit `TEST_DATABASE_URL`, with driver `postgresql+psycopg`, a host, no URL query overrides, and a database name ending in `_test`. Missing or unsafe configuration aborts pytest before application import, without falling back to `DATABASE_URL`. The fixture also verifies the actual database name before deletion. The name check cannot prove that a database is disposable; setting these variables explicitly authorizes destruction of that database. Do not run workers or another test suite against it concurrently.
+Tests **delete every row in `synthetic_receiver_events`, `outbox_events` and `jobs`**, in that order; migration tests also downgrade and upgrade the test schema. Use a dedicated disposable PostgreSQL database. Never point these commands at development or production data. Tests require both `TEST_DATABASE=1` and an explicit `TEST_DATABASE_URL`, with driver `postgresql+psycopg`, a host, no URL query overrides, and a database name ending in `_test`. Missing or unsafe configuration aborts pytest before application import, without falling back to `DATABASE_URL`. The fixture also verifies the actual database name before deletion. The name check cannot prove that a database is disposable; setting these variables explicitly authorizes destruction of that database. Do not run workers or another test suite against it concurrently.
 
 For example, start a fresh container without persistent storage (choose a free port):
 
@@ -111,4 +139,6 @@ Integration coverage includes eight-process initial and scheduled recovery claim
 
 Phase-2D-1 adds PostgreSQL tests for atomic visibility/rollback, opt-in and payload filtering, stale/concurrent completions, recovery after completion failure, database constraints and data preservation through `0004 → 0005 → 0004`. See the [phase-2D-1 validation record](docs/phase-2d1-validation.md).
 
-Next steps: design an at-least-once dispatcher and recipient deduplication before external effects; operational retry/failure metrics. Jitter, heartbeat and cancellation need explicit follow-up semantics.
+Phase-2D-2 adds real PostgreSQL coverage for eight concurrent dispatchers, stable-ID duplicate acceptance, process crash/recovery between receiver commit and ack, stale-token ack/retry rejection, real database failures and ambiguous commit responses, privacy filtering, and exact `0005 → 0006 → 0005` data preservation. Run just these tests with `TEST_DATABASE=1 uv run pytest -q tests/test_dispatcher.py tests/test_migrations.py` after setting the explicit disposable `TEST_DATABASE_URL` above. See the [phase-2D-2 validation record](docs/phase-2d2-validation.md).
+
+Next phase: design a real transport adapter and durable recipient idempotency contract, including timeouts/uncertain responses and an explicit dead-letter/operator policy. Operational metrics, jitter, heartbeat and cancellation require follow-up semantics.

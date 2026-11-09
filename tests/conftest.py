@@ -44,13 +44,14 @@ def database():
     from sqlalchemy import delete, text
 
     from task_engine.db import Session
-    from task_engine.models import Job, OutboxEvent
+    from task_engine.models import Job, OutboxEvent, SyntheticReceiverEvent
 
     expected = make_url(disposable_database_url(os.environ)).database
     with Session.begin() as session:
         # Verify the actual target before any destructive statement, not just the URL.
         if session.scalar(text("SELECT current_database()")) != expected:
             raise pytest.UsageError("Connected database differs from TEST_DATABASE_URL")
+        session.execute(delete(SyntheticReceiverEvent))
         session.execute(delete(OutboxEvent))
         session.execute(delete(Job))
     try:
@@ -59,5 +60,6 @@ def database():
         with Session.begin() as session:
             if session.scalar(text("SELECT current_database()")) != expected:
                 raise pytest.UsageError("Connected database differs from TEST_DATABASE_URL")
+            session.execute(delete(SyntheticReceiverEvent))
             session.execute(delete(OutboxEvent))
             session.execute(delete(Job))

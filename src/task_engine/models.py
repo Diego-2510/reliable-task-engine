@@ -68,10 +68,26 @@ class OutboxEvent(Base):
         UniqueConstraint("job_id", "event_type", name="uq_outbox_job_event_type"),
         CheckConstraint("event_type = 'job.succeeded.v1'", name="ck_outbox_event_type"),
         CheckConstraint(
-            "delivery_state IN ('pending', 'delivering', 'delivered')",
+            "delivery_state IN ('pending', 'delivering', 'delivered', 'dead_letter')",
             name="ck_outbox_delivery_state",
         ),
         CheckConstraint("delivery_attempts >= 0", name="ck_outbox_delivery_attempts"),
+        CheckConstraint("max_delivery_attempts > 0", name="ck_outbox_max_delivery_attempts"),
+        CheckConstraint("replay_count >= 0", name="ck_outbox_replay_count"),
+        CheckConstraint(
+            "delivery_last_error_code IN ('retryable_error', 'permanent_error', 'lease_expired')",
+            name="ck_outbox_delivery_last_error_code",
+        ),
+        CheckConstraint(
+            "dead_letter_reason IN ('permanent_error', 'attempts_exhausted')",
+            name="ck_outbox_dead_letter_reason",
+        ),
+        CheckConstraint(
+            "(delivery_state = 'dead_letter' AND dead_lettered_at IS NOT NULL "
+            "AND dead_letter_reason IS NOT NULL) OR (delivery_state <> 'dead_letter' "
+            "AND dead_lettered_at IS NULL AND dead_letter_reason IS NULL)",
+            name="ck_outbox_dead_letter_state",
+        ),
         CheckConstraint(
             "(delivery_state = 'delivering' AND delivery_token IS NOT NULL "
             "AND delivery_lease_expires_at IS NOT NULL) OR "
@@ -96,6 +112,12 @@ class OutboxEvent(Base):
         String(16), nullable=False, server_default="pending",
     )
     delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    max_delivery_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="5")
+    delivery_last_error_code: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dead_letter_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    replay_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_replayed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     next_attempt_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp(),
     )

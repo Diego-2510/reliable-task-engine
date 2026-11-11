@@ -229,16 +229,22 @@ def test_0006_preserves_all_jobs_and_existing_outbox_data(database):
             assert any("delivery_lease_expires_at, id" in value and "delivering" in value
                        for value in delivery_indexes)
         # Populate all delivery states and receiver data before testing the downgrade.
-        from task_engine.dispatcher import (
-            acknowledge_delivery,
-            claim_delivery,
-            deliver_to_synthetic_receiver,
-        )
-        first = claim_delivery()
-        deliver_to_synthetic_receiver(first)
-        acknowledge_delivery(first.event_id, first.token)
-        second = claim_delivery()
-        assert second is not None
+        # Seed the historical schema directly: current dispatcher requires 0007.
+        with engine.begin() as connection:
+            ids = connection.scalars(text("SELECT id FROM outbox_events ORDER BY id")).all()
+            connection.execute(text(
+                "UPDATE outbox_events SET delivery_state = 'delivered', delivery_attempts = 1, "
+                "delivered_at = clock_timestamp() WHERE id = :id"
+            ), {"id": ids[0]})
+            connection.execute(text(
+                "INSERT INTO synthetic_receiver_events (event_id,job_id,event_type) "
+                "SELECT id,job_id,event_type FROM outbox_events WHERE id = :id"
+            ), {"id": ids[0]})
+            connection.execute(text(
+                "UPDATE outbox_events SET delivery_state = 'delivering', delivery_attempts = 1, "
+                "delivery_token = gen_random_uuid(), "
+                "delivery_lease_expires_at = clock_timestamp() + interval '1 hour' WHERE id = :id"
+            ), {"id": ids[1]})
         command.downgrade(config, "0005")
         with engine.connect() as connection:
             assert connection.scalar(text("SELECT to_regclass('synthetic_receiver_events')")) is None
@@ -259,5 +265,150 @@ def test_0006_preserves_all_jobs_and_existing_outbox_data(database):
                 "AND delivery_attempts = 0"
             )) == 3
             assert connection.scalar(text("SELECT count(*) FROM synthetic_receiver_events")) == 0
+    finally:
+        command.upgrade(config, "head")
+
+
+def test_0007_preserves_history_and_recovers_only_exhausted_claims(database):
+    from sqlalchemy.exc import DBAPIError
+
+    from task_engine.dispatcher import acknowledge_delivery, claim_delivery
+
+    config = Config("alembic.ini")
+    command.downgrade(config, "0006")
+    try:
+        with engine.begin() as connection:
+            for state in ("pending", "delivered", "delivering_valid", "delivering_expired"):
+                for attempts in (0, 1, 5, 12, 2_147_483_647):
+                    job_id, event_id = uuid.uuid4(), uuid.uuid4()
+                    connection.execute(text(
+                        "INSERT INTO jobs (id,payload,status,attempts) "
+                        "VALUES (:id,CAST(:payload AS jsonb),'succeeded',1)"
+                    ), {"id": job_id, "payload": '{"legacy":true}'})
+                    connection.execute(text(
+                        "INSERT INTO outbox_events (id,job_id,event_type,payload,created_at,"
+                        "delivery_state,delivery_attempts,next_attempt_at,delivery_token,"
+                        "delivery_lease_expires_at,delivered_at) VALUES "
+                        "(:id,:job_id,'job.succeeded.v1','{\"legacy\":[1,true,null]}',"
+                        "clock_timestamp() - interval '3 days',CAST(:state AS varchar),:attempts,"
+                        "clock_timestamp() - interval '2 days',"
+                        "CASE WHEN :state = 'delivering' THEN gen_random_uuid() END,"
+                        "CASE WHEN :state = 'delivering' THEN clock_timestamp() + "
+                        "CAST(:lease_delta AS interval) END,"
+                        "CASE WHEN :state = 'delivered' THEN "
+                        "clock_timestamp() - interval '1 day' END)"
+                    ), {"id": event_id, "job_id": job_id, "attempts": attempts,
+                        "state": state.split("_")[0],
+                        "lease_delta": "1 hour" if state.endswith("valid") else "-1 hour"})
+                    if state in ("delivered", "delivering_expired"):
+                        connection.execute(text(
+                            "INSERT INTO synthetic_receiver_events (event_id,job_id,event_type,"
+                            "processed_at) VALUES (:id,:job_id,'job.succeeded.v1',"
+                            "clock_timestamp() - interval '1 day')"
+                        ), {"id": event_id, "job_id": job_id})
+            before = [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM outbox_events ORDER BY id"))]
+            jobs_before = connection.execute(text("SELECT * FROM jobs ORDER BY id")).all()
+            receiver_before = connection.execute(text(
+                "SELECT * FROM synthetic_receiver_events ORDER BY event_id")).all()
+            indexes_before = connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename IN "
+                "('jobs','outbox_events','synthetic_receiver_events') ORDER BY indexname")).all()
+            earliest = connection.scalar(select(func.clock_timestamp()))
+        command.upgrade(config, "0007")
+        with engine.connect() as connection:
+            latest = connection.scalar(select(func.clock_timestamp()))
+            after = [dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM outbox_events ORDER BY id"))]
+            assert len(before) == len(after) == 20
+            for old, new in zip(before, after, strict=True):
+                exhausted = old["delivery_state"] == "pending" and old["delivery_attempts"] >= 5
+                assert new.pop("max_delivery_attempts") == max(5, old["delivery_attempts"])
+                assert new.pop("delivery_last_error_code") is None
+                assert new.pop("replay_count") == 0 and new.pop("last_replayed_at") is None
+                assert new.pop("dead_letter_reason") == ("attempts_exhausted" if exhausted else None)
+                timestamp = new.pop("dead_lettered_at")
+                if exhausted:
+                    assert earliest <= timestamp <= latest
+                    assert new.pop("delivery_state") == "dead_letter"
+                    old = {key: value for key, value in old.items() if key != "delivery_state"}
+                else:
+                    assert timestamp is None
+                assert new == old  # Every pre-existing column, including tokens and deadlines.
+            assert connection.execute(text("SELECT * FROM jobs ORDER BY id")).all() == jobs_before
+            assert connection.execute(text(
+                "SELECT * FROM synthetic_receiver_events ORDER BY event_id")).all() == receiver_before
+            assert connection.execute(text(
+                "SELECT indexdef FROM pg_indexes WHERE tablename IN "
+                "('jobs','outbox_events','synthetic_receiver_events') ORDER BY indexname"
+            )).all() == indexes_before
+        # Existing valid claims, including the integer maximum, can still acknowledge.
+        now = latest
+        for row in before:
+            if (row["delivery_state"] == "delivering"
+                    and row["delivery_lease_expires_at"] > now):
+                acknowledge_delivery(row["id"], row["delivery_token"])
+        claim_delivery()  # Also recovers exhausted expired claims; may claim an unrelated due row.
+        with engine.connect() as connection:
+            for row in before:
+                if (row["delivery_state"] == "delivering"
+                        and row["delivery_lease_expires_at"] < now
+                        and row["delivery_attempts"] >= 5):
+                    new = connection.execute(text("SELECT * FROM outbox_events WHERE id = :id"),
+                                             {"id": row["id"]}).one()
+                    assert new.delivery_state == "dead_letter"
+                    assert new.delivery_attempts == row["delivery_attempts"]
+                    assert new.dead_letter_reason == "attempts_exhausted"
+                    assert new.delivery_last_error_code == "lease_expired"
+            assert connection.execute(text(
+                "SELECT * FROM synthetic_receiver_events ORDER BY event_id")).all() == receiver_before
+            state_before_downgrade = connection.execute(text(
+                "SELECT * FROM outbox_events ORDER BY id")).all()
+        with pytest.raises(DBAPIError, match="resolve dead_letter"):
+            command.downgrade(config, "0006")
+        with engine.connect() as connection:
+            assert connection.scalar(text("SELECT version_num FROM alembic_version")) == "0007"
+            assert connection.execute(text(
+                "SELECT * FROM outbox_events ORDER BY id")).all() == state_before_downgrade
+    finally:
+        command.upgrade(config, "head")
+
+
+def test_0007_downgrade_preserves_0006_columns_and_receiver(database):
+    from test_dispatcher import add_event, receiver_rows, snapshot
+
+    from task_engine.dispatcher import claim_delivery, dead_letter_delivery, run_once
+    from task_engine.operator import replay_event
+
+    config = Config("alembic.ini")
+    delivered = add_event()
+    assert run_once()
+    pending = add_event()
+    owner = claim_delivery()
+    dead_letter_delivery(pending, owner.token)
+    replay_event(pending, 3)
+    active = add_event()
+    # Keep the replay pending and claim the other event.
+    with engine.begin() as connection:
+        connection.execute(text(
+            "UPDATE outbox_events SET next_attempt_at = clock_timestamp() + interval '1 day' "
+            "WHERE id = :id"
+        ), {"id": pending})
+    assert claim_delivery().event_id == active
+    new_columns = {"max_delivery_attempts", "delivery_last_error_code", "dead_letter_reason",
+                   "dead_lettered_at", "replay_count", "last_replayed_at"}
+    before = {i: {key: value for key, value in snapshot(i).items() if key not in new_columns}
+              for i in (delivered, pending, active)}
+    rows = receiver_rows()
+    try:
+        command.downgrade(config, "0006")
+        with engine.connect() as connection:
+            assert {row.id: dict(row._mapping) for row in connection.execute(
+                text("SELECT * FROM outbox_events"))} == before
+        assert receiver_rows() == rows
+        command.upgrade(config, "0007")
+        assert receiver_rows() == rows
+        assert snapshot(pending)["replay_count"] == 0  # Downgrade discards replay audit.
+        assert snapshot(pending)["max_delivery_attempts"] == 5
     finally:
         command.upgrade(config, "head")

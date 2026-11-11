@@ -20,6 +20,7 @@ from task_engine.dispatcher import (
     RetryableDeliveryError,
     acknowledge_delivery,
     claim_delivery,
+    dead_letter_delivery,
     deliver_to_synthetic_receiver,
     delivery_backoff_seconds,
     delivery_lease_seconds,
@@ -275,9 +276,10 @@ def test_crash_after_receiver_commit_recovers_one_effect(database):
         acknowledge_delivery(event_id, before["delivery_token"])
 
 
-@pytest.mark.parametrize("transition", [acknowledge_delivery, schedule_delivery_retry])
+@pytest.mark.parametrize("transition", [acknowledge_delivery, schedule_delivery_retry,
+                                         dead_letter_delivery])
 @pytest.mark.parametrize("lost", ["reclaimed", "expired", "wrong_token", "missing", "delivered"])
-def test_fences_ack_and_retry(database, transition, lost):
+def test_fences_owner_transitions(database, transition, lost):
     event_id = add_event()
     claimed = claim_delivery()
     token = claimed.token
@@ -300,7 +302,8 @@ def test_fences_ack_and_retry(database, transition, lost):
         assert snapshot(event_id) == before
 
 
-@pytest.mark.parametrize("transition", [acknowledge_delivery, schedule_delivery_retry])
+@pytest.mark.parametrize("transition", [acknowledge_delivery, schedule_delivery_retry,
+                                         dead_letter_delivery])
 def test_expiry_checked_after_lock_wait(database, transition):
     event_id = add_event()
     claimed = claim_delivery()
@@ -366,11 +369,12 @@ def test_temporary_receiver_error_schedules_backoff_and_later_delivers(database,
     assert all(record.exc_info is None for record in caplog.records)
 
 
-def test_retry_backoff_caps_without_attempt_budget(database):
+def test_retry_backoff_caps_with_historical_attempt_budget(database):
     event_id = add_event()
     with engine.begin() as connection:
         connection.execute(text(
-            "UPDATE outbox_events SET delivery_attempts = 1000 WHERE id = :id"
+            "UPDATE outbox_events SET delivery_attempts = 1000, "
+            "max_delivery_attempts = 1003 WHERE id = :id"
         ), {"id": event_id})
     for attempt in (1001, 1002):
         claimed = claim_delivery()
@@ -529,7 +533,8 @@ def test_main_stops_visibly_without_database_diagnostics(database, monkeypatch, 
     assert receiver_rows() == []
 
 
-@pytest.mark.parametrize("transition", [acknowledge_delivery, schedule_delivery_retry])
+@pytest.mark.parametrize("transition", [acknowledge_delivery, schedule_delivery_retry,
+                                         dead_letter_delivery])
 def test_concurrent_same_token_transitions_have_one_winner(database, transition):
     event_id = add_event()
     claimed = claim_delivery()

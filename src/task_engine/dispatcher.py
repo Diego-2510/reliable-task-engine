@@ -16,6 +16,7 @@ from sqlalchemy.sql.elements import ColumnElement
 
 from task_engine.db import Session
 from task_engine.models import OutboxEvent, SyntheticReceiverEvent
+from task_engine.telemetry import configure_logging, initialize, outcome, record, traced
 
 log = logging.getLogger(__name__)
 RECOVERY_BATCH_SIZE = 100
@@ -69,35 +70,46 @@ def _eligible() -> ColumnElement[bool]:
     )
 
 
+@traced("dispatcher", "claim")
 def claim_delivery() -> DeliveryClaim | None:
     duration = timedelta(seconds=delivery_lease_seconds())
+    claimed = None
+    reclaimed = False
     with Session.begin() as session:
-        _recover_exhausted(session)
+        recovered = _recover_exhausted(session)
         # Select only envelope metadata; arbitrary JSON payloads never enter the dispatcher.
         row = session.execute(
-            select(OutboxEvent.id, OutboxEvent.job_id, OutboxEvent.event_type)
+            select(OutboxEvent.id, OutboxEvent.job_id, OutboxEvent.event_type,
+                   OutboxEvent.delivery_state)
             .where(_eligible())
             .order_by(OutboxEvent.next_attempt_at, OutboxEvent.created_at, OutboxEvent.id)
             .with_for_update(skip_locked=True)
             .limit(1)
         ).one_or_none()
-        if row is None:
-            return None
-        token = uuid.uuid4()
-        changed = session.scalar(
-            update(OutboxEvent)
-            .where(OutboxEvent.id == row.id, _eligible())
-            .values(
-                delivery_state="delivering", delivery_token=token,
-                delivery_lease_expires_at=func.clock_timestamp() + duration,
-                delivery_attempts=OutboxEvent.delivery_attempts + 1,
+        if row is not None:
+            token = uuid.uuid4()
+            changed = session.scalar(
+                update(OutboxEvent)
+                .where(OutboxEvent.id == row.id, _eligible())
+                .values(
+                    delivery_state="delivering", delivery_token=token,
+                    delivery_lease_expires_at=func.clock_timestamp() + duration,
+                    delivery_attempts=OutboxEvent.delivery_attempts + 1,
+                )
+                .returning(OutboxEvent.id)
             )
-            .returning(OutboxEvent.id)
-        )
-        if changed is None:  # Wall time may have changed since selection.
-            return None
-        claimed = DeliveryClaim(row.id, row.job_id, row.event_type, token)
+            if changed is not None:
+                claimed = DeliveryClaim(row.id, row.job_id, row.event_type, token)
+                reclaimed = row.delivery_state == "delivering"
     # No claim escapes before COMMIT, including when its result is uncertain.
+    if recovered:
+        record("dispatcher", "recover", "dead_letter", count=recovered, error_code="lease_expired")
+    if claimed is not None:
+        record("dispatcher", "claim", "claimed")
+        if reclaimed:
+            record("dispatcher", "recover", "reclaimed", error_code="lease_expired")
+    else:
+        outcome("dispatcher", "claim", "empty")
     return claimed
 
 
@@ -116,7 +128,13 @@ def deliver_to_synthetic_receiver(claimed: DeliveryClaim) -> None:
         )
 
 
-def _recover_exhausted(session: OrmSession) -> None:
+@traced("dispatcher", "receive")
+def _invoke_receiver(claimed: DeliveryClaim) -> None:
+    deliver_to_synthetic_receiver(claimed)
+
+
+@traced("dispatcher", "recover")
+def _recover_exhausted(session: OrmSession) -> int:
     """Bounded SKIP LOCKED recovery in the claim transaction, even on empty polls."""
     exhausted = and_(
         OutboxEvent.delivery_state == "delivering",
@@ -129,15 +147,18 @@ def _recover_exhausted(session: OrmSession) -> None:
         .with_for_update(skip_locked=True).limit(RECOVERY_BATCH_SIZE)
     ))
     if ids:
-        session.execute(
+        changed = session.scalars(
             update(OutboxEvent).where(OutboxEvent.id.in_(ids), exhausted).values(
                 delivery_state="dead_letter", delivery_token=None,
                 delivery_lease_expires_at=None, dead_lettered_at=func.clock_timestamp(),
                 dead_letter_reason="attempts_exhausted", delivery_last_error_code="lease_expired",
-            )
-        )
+            ).returning(OutboxEvent.id)
+        ).all()
+        return len(changed)
+    return 0
 
 
+@traced("dispatcher", "finish")
 def _finish_delivery(
     event_id: uuid.UUID, token: uuid.UUID, *,
     outcome: Literal["success", "retryable_error", "permanent_error"],
@@ -180,6 +201,10 @@ def _finish_delivery(
         if changed is None:
             raise DeliveryLeaseLostError(f"Delivery lease lost for event {event_id}")
 
+    record("dispatcher", "finish",
+           "dead_letter" if dead_letter else "retry" if retry else "acknowledged",
+           error_code=None if outcome == "success" else outcome)
+
 
 def acknowledge_delivery(event_id: uuid.UUID, token: uuid.UUID) -> None:
     _finish_delivery(event_id, token, outcome="success")
@@ -200,33 +225,37 @@ def run_once() -> bool:
         return False
     try:
         try:
-            deliver_to_synthetic_receiver(claimed)
+            _invoke_receiver(claimed)
         except PermanentDeliveryError:
-            log.warning("Event %s receiver failure: permanent_error", claimed.event_id)
+            log.warning("Event %s receiver failure: permanent_error", claimed.event_id,
+                        extra={"event": "receive", "outcome": "permanent_error"})
             dead_letter_delivery(claimed.event_id, claimed.token)
         except RetryableDeliveryError:
-            log.warning("Event %s receiver failure: retryable_error", claimed.event_id)
+            log.warning("Event %s receiver failure: retryable_error", claimed.event_id,
+                        extra={"event": "receive", "outcome": "retryable_error"})
             schedule_delivery_retry(claimed.event_id, claimed.token)
         else:
             acknowledge_delivery(claimed.event_id, claimed.token)
     except DeliveryLeaseLostError:
-        log.warning("Delivery lease lost for event %s; discarded transition", claimed.event_id)
+        log.warning("Delivery lease lost for event %s; discarded transition", claimed.event_id,
+                    extra={"event": "finish", "outcome": "lease_lost"})
     # Database errors (including uncertain commits) and process termination propagate.
     return True
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
+    configure_logging()
+    initialize("dispatcher")
     try:
         while True:
             if not run_once():
                 time.sleep(1)
     except SQLAlchemyError:
         # Stop visibly without leaking driver diagnostics, statement values or credentials.
-        log.critical("Dispatcher stopped: database_error")
+        log.critical("Dispatcher stopped: database_error", extra={"outcome": "database_error"})
         raise SystemExit(1) from None
     except Exception:  # noqa: BLE001 - fatal CLI boundary must not expose diagnostics
-        log.critical("Dispatcher stopped: unexpected_error")
+        log.critical("Dispatcher stopped: unexpected_error", extra={"outcome": "unexpected_error"})
         raise SystemExit(1) from None
 
 

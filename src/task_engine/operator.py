@@ -1,6 +1,7 @@
 """Local operator recovery; no HTTP endpoint and no receiver invocation."""
 
 import argparse
+import logging
 import sys
 import uuid
 from collections.abc import Sequence
@@ -11,6 +12,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from task_engine.db import Session
 from task_engine.models import OutboxEvent
+from task_engine.telemetry import configure_logging, initialize, record, traced
 
 PG_INTEGER_MAX = 2_147_483_647
 MAX_EXTRA_ATTEMPTS = 1000
@@ -25,6 +27,7 @@ class ReplayError(Exception):
         self.exit_code = exit_code
 
 
+@traced("operator", "replay")
 def replay_event(event_id: uuid.UUID, extra_attempts: int) -> None:
     if type(extra_attempts) is not int or not 1 <= extra_attempts <= MAX_EXTRA_ATTEMPTS:
         raise ReplayError("invalid_budget", 2)
@@ -51,6 +54,7 @@ def replay_event(event_id: uuid.UUID, extra_attempts: int) -> None:
             )
         )
     # Successful return requires confirmed commit; attempts and receiver rows never change.
+    record("operator", "replay", "replayed")
 
 
 class _Parser(argparse.ArgumentParser):
@@ -60,6 +64,8 @@ class _Parser(argparse.ArgumentParser):
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_logging(level=logging.WARNING)
+    initialize("operator")
     parser = _Parser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     replay = commands.add_parser("replay-event")

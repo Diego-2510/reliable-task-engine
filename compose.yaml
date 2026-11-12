@@ -16,6 +16,8 @@ services:
     build: .
     environment: &env
       DATABASE_URL: postgresql+psycopg://task:task@db:5432/task
+      TASK_ENGINE_TELEMETRY: ${TASK_ENGINE_TELEMETRY:-disabled}
+      TASK_ENGINE_LOG_FORMAT: ${TASK_ENGINE_LOG_FORMAT:-human}
     depends_on:
       db: {condition: service_healthy}
     command: ["alembic", "upgrade", "head"]
@@ -33,5 +35,13 @@ services:
     depends_on:
       migrate: {condition: service_completed_successfully}
     command: ["python", "-m", "task_engine.worker"]
+  dispatcher:
+    build: .
+    environment:
+      <<: *env
+      DELIVERY_LEASE_SECONDS: ${DELIVERY_LEASE_SECONDS:-60}
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+    command: ["python", "-m", "task_engine.dispatcher"]
 volumes:
   pgdata:

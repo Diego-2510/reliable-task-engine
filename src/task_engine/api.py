@@ -1,4 +1,6 @@
 import uuid
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
@@ -12,8 +14,17 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from task_engine.db import Session
 from task_engine.models import Job
+from task_engine.telemetry import configure_logging, initialize, outcome, record, traced
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    configure_logging()
+    initialize("api")
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 class JobInput(BaseModel):
@@ -53,14 +64,18 @@ async def database_error(request: Request, exc: SQLAlchemyError) -> JSONResponse
     200: {"model": JobOutput, "description": "Existing job"},
     409: {"description": "Idempotency conflict"},
 })
+@traced("api", "submit")
 def create_job(body: JobInput, request: Request, response: Response) -> Any:
     keys = request.headers.getlist("idempotency-key")
     key = keys[0] if keys else None
     if keys and (len(keys) != 1 or not key or len(key) > 128
                  or any(not "!" <= char <= "~" for char in key)):
+        outcome("api", "submit", "invalid_input")
         return JSONResponse(status_code=422, content={
             "error": {"code": "invalid_input", "message": "Invalid request"},
         })
+    submission_outcome = "created"
+    conflict = None
     with Session.begin() as session:
         # Each statement needs a fresh snapshot after a competing insert commits.
         session.connection(execution_options={"isolation_level": "READ COMMITTED"})
@@ -80,18 +95,25 @@ def create_job(body: JobInput, request: Request, response: Response) -> Any:
             ).where(Job.idempotency_key == key)).one()
             # JSONB equality ignores nested object order and preserves JSON types.
             if not matches:
-                return JSONResponse(status_code=409, content={"error": {
+                submission_outcome = "conflict"
+                conflict = JSONResponse(status_code=409, content={"error": {
                     "code": "idempotency_conflict",
                     "message": "Job parameters differ from the original submission",
                 }})
-            response.status_code = 200
-    return job
+            else:
+                submission_outcome = "replayed"
+                response.status_code = 200
+    record("api", "submit", submission_outcome)
+    return conflict if conflict is not None else job
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobOutput, responses={404: {"description": "Job not found"}})
+@traced("api", "lookup")
 def get_job(job_id: uuid.UUID) -> Any:
     with Session() as session:
         job = session.get(Job, job_id)
         if job is None:
+            outcome("api", "lookup", "not_found")
             return JSONResponse(status_code=404, content={"error": {"code": "not_found", "message": "Job not found"}})
+        outcome("api", "lookup", "found")
         return job

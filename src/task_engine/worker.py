@@ -7,9 +7,11 @@ from enum import Enum
 from typing import Literal
 
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import SQLAlchemyError
 
 from task_engine.db import Session
 from task_engine.models import Job, OutboxEvent
+from task_engine.telemetry import configure_logging, initialize, outcome, record, traced
 
 log = logging.getLogger(__name__)
 ErrorCode = Literal["retryable_error", "permanent_error", "unexpected_error"]
@@ -54,9 +56,16 @@ def handle(payload: dict[str, object]) -> SyntheticEventIntent | None:
     return None
 
 
+@traced("worker", "handle")
+def _execute_handler(payload: dict[str, object]) -> SyntheticEventIntent | None:
+    return handle(payload)
+
+
+@traced("worker", "recover")
 def recover_expired() -> int:
     """Recover a bounded batch on every poll, even when no new claim is possible."""
     recovered = 0
+    outcomes: dict[str, int] = {}
     with Session.begin() as session:
         jobs = session.scalars(
             select(Job)
@@ -89,9 +98,15 @@ def recover_expired() -> int:
                 .returning(Job.id)
             )
             recovered += changed is not None
+            if changed is not None:
+                value = "failed" if exhausted else "retry"
+                outcomes[value] = outcomes.get(value, 0) + 1
+    for value, count in outcomes.items():
+        record("worker", "recover", value, count=count, error_code="lease_expired")
     return recovered
 
 
+@traced("worker", "claim")
 def claim() -> tuple[uuid.UUID, uuid.UUID, dict[str, object]] | None:
     duration = timedelta(seconds=lease_seconds())
     recover_expired()
@@ -107,6 +122,7 @@ def claim() -> tuple[uuid.UUID, uuid.UUID, dict[str, object]] | None:
             .limit(1)
         )
         if job is None:
+            outcome("worker", "claim", "empty")
             return None
         token = uuid.uuid4()
         job.status = "running"
@@ -117,9 +133,11 @@ def claim() -> tuple[uuid.UUID, uuid.UUID, dict[str, object]] | None:
         session.flush()
         claimed = job.id, token, job.payload
     # Commit before exposing ownership to the handler; no transaction spans execution.
+    record("worker", "claim", "claimed")
     return claimed
 
 
+@traced("worker", "finish")
 def _finish(
     job_id: uuid.UUID, token: uuid.UUID, code: ErrorCode | None,
     event_intent: SyntheticEventIntent | None = None,
@@ -161,6 +179,8 @@ def _finish(
             # Insert errors propagate and abort BOTH writes; there is one commit.
             session.flush()
 
+    record("worker", "finish", "retry" if retry else status, error_code=code)
+
 
 def complete(
     job_id: uuid.UUID, token: uuid.UUID, status: Literal["succeeded", "failed"], *,
@@ -182,7 +202,8 @@ def fail(job_id: uuid.UUID, token: uuid.UUID, error: Exception) -> None:
         code = "retryable_error"
     else:
         code = "unexpected_error"
-    log.warning("Job %s handler failure: %s", job_id, code)
+    log.warning("Job %s handler failure: %s", job_id, code,
+                extra={"event": "handle", "outcome": code})
     _finish(job_id, token, code)
 
 
@@ -194,22 +215,31 @@ def run_once() -> bool:
     status = "succeeded"
     try:
         try:
-            event_intent = handle(payload)
+            event_intent = _execute_handler(payload)
         except Exception as error:  # noqa: BLE001 - bound unknown handler failures; never log text
             status = "failed"
             fail(job_id, token, error)
         else:
             complete(job_id, token, "succeeded", event_intent=event_intent)
     except LeaseLostError:
-        log.warning("Lease lost for job %s; discarded %s completion", job_id, status)
+        log.warning("Lease lost for job %s; discarded %s completion", job_id, status,
+                    extra={"event": "finish", "outcome": "lease_lost"})
     return True
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO)
-    while True:
-        if not run_once():
-            time.sleep(1)
+    configure_logging()
+    initialize("worker")
+    try:
+        while True:
+            if not run_once():
+                time.sleep(1)
+    except SQLAlchemyError:
+        log.critical("Worker stopped: database_error", extra={"outcome": "database_error"})
+        raise SystemExit(1) from None
+    except Exception:  # noqa: BLE001 - sanitized fatal process boundary
+        log.critical("Worker stopped: unexpected_error", extra={"outcome": "unexpected_error"})
+        raise SystemExit(1) from None
 
 
 if __name__ == "__main__":

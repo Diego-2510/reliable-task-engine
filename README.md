@@ -1,16 +1,16 @@
-# Reliable Task Engine — phase 2D-3
+# Reliable Task Engine — phase 3A
 
 A small PostgreSQL-backed job queue with a FastAPI service and independent polling workers. Python 3.12 and the checked-in uv lockfile define the application environment. Handlers are synthetic and perform no external business effects.
 
 ## Quickstart
 
-Run `docker compose up --build --scale worker=2` for a new installation. The migration runs before the API and workers. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -d '{"payload":{"example":1},"max_attempts":3}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects. Omitting `max_attempts` retains the default of 3. `{"fail":true}` permanently fails on its first attempt. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
+Run `docker compose up --build --scale worker=2` for a new installation. The migration runs before the API, workers and dispatcher. Compose starts one dispatcher automatically, with no additional public port. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -d '{"payload":{"example":1},"max_attempts":3}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects. Omitting `max_attempts` retains the default of 3. `{"fail":true}` permanently fails on its first attempt. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
 
 For local development: `uv sync --locked`; start PostgreSQL, set `DATABASE_URL` if needed, run `uv run alembic upgrade head`, then `uv run uvicorn task_engine.api:app`, `uv run python -m task_engine.worker` and, in a separate process, `uv run python -m task_engine.dispatcher`. Default connection is `postgresql+psycopg://task:task@localhost:5432/task`. The Compose credentials are for local development only.
 
 ## Upgrade and configuration
 
-**Stop all existing workers, API instances and dispatchers before schema migration**, including phase-2A workers; they do not honor retry eligibility or attempt limits. Older workers also cannot enqueue outbox intents. Stop locally started dispatchers separately. For an existing Compose installation, use `docker compose stop worker api`, `docker compose build`, `docker compose run --rm migrate`, then `docker compose up -d --scale worker=2`. Resume only upgraded binaries. Earlier migrations take a table lock and update existing rows; allow downtime and plan for table/index work on large queues. Do not use the fresh-install command to perform a rolling upgrade with old workers still running.
+**Stop all existing workers, API instances and dispatchers before schema migration**, including phase-2A workers; they do not honor retry eligibility or attempt limits. Older workers also cannot enqueue outbox intents. Stop locally started dispatchers separately. For an existing Compose installation, use `docker compose stop worker api dispatcher`, `docker compose build`, `docker compose run --rm migrate`, then `docker compose up -d --scale worker=2`. Resume only upgraded binaries. Earlier migrations take a table lock and update existing rows; allow downtime and plan for table/index work on large queues. Do not use the fresh-install command to perform a rolling upgrade with old workers still running.
 
 Migration `0003` adds `max_attempts` (positive integer, database default 3), `available_at` (TIMESTAMPTZ, database wall-time default), and nullable fixed-vocabulary `last_error_code` and `terminal_reason`. Backfill sets `available_at = created_at` and `max_attempts = greatest(3, attempts)`. Attempts, payloads, IDs, creation/update timestamps and lease metadata are preserved. Historical attempts above 3, including above 10, are supported without granting additional claims. Already exhausted queued jobs become `failed` with `attempts_exhausted`; running jobs retain their existing lease and can complete successfully while valid, or be recovered according to the new limit after expiry. Existing terminal jobs retain their status; old failed jobs receive `legacy_failure`, without inventing an error code. Migration `0002` still initializes expired leases for phase-1 running rows.
 
@@ -162,4 +162,133 @@ Phase-2D-2 adds real PostgreSQL coverage for eight concurrent dispatchers, stabl
 
 Phase-2D-3 adds bounded delivery, permanent rejection, exhausted-lease recovery, fenced dead-letter transitions, atomic operator replay and integer-boundary tests. Real PostgreSQL migration checks preserve historical `0006` events and receiver rows, including claims at the integer maximum. See the [phase-2D-3 validation record](docs/phase-2d3-validation.md).
 
-Next phase: design a real transport adapter and durable recipient idempotency contract, including timeouts/uncertain responses and deduplication retention across operator replay. Operational metrics, jitter, heartbeat and cancellation require follow-up semantics.
+Next phase: design a real transport adapter and durable recipient idempotency contract, including timeouts/uncertain responses and deduplication retention across operator replay. Production metric aggregation, jitter, heartbeat and cancellation require follow-up semantics.
+
+
+## Observability architecture and configuration
+
+Manual OpenTelemetry instrumentation uses a small shared module with private
+process-local providers. API lifespan and each worker, dispatcher and operator
+CLI initialize independently, once per process. Imports and jobs do not initialize
+exporters. The default exports nothing; no telemetry backend is required.
+
+| Setting | Default | Opt-in behavior |
+| --- | --- | --- |
+| `TASK_ENGINE_TELEMETRY` | `disabled` | `console`: completed spans to stdout; cumulative metrics every 10 seconds and at orderly shutdown |
+| `TASK_ENGINE_LOG_FORMAT` | `human` | `json`: standard-library JSON formatter for application/root/Uvicorn handlers |
+
+```sh
+# All Compose application components; no collector or new public ports.
+TASK_ENGINE_TELEMETRY=console TASK_ENGINE_LOG_FORMAT=json docker compose up --build
+
+# Independent local process examples, after configuring DATABASE_URL:
+TASK_ENGINE_TELEMETRY=console TASK_ENGINE_LOG_FORMAT=json uv run uvicorn task_engine.api:app
+TASK_ENGINE_TELEMETRY=console TASK_ENGINE_LOG_FORMAT=json uv run python -m task_engine.worker
+TASK_ENGINE_TELEMETRY=console TASK_ENGINE_LOG_FORMAT=json uv run python -m task_engine.dispatcher
+# Local aggregate SELECT only; no recovery or mutation:
+uv run python -m task_engine.diagnostics
+```
+
+Only `disabled` and `console` telemetry modes are supported; invalid modes fail at
+startup with a fixed diagnostic. No OTLP package, auto-instrumentation, network
+export, collector, Jaeger, Grafana or Prometheus is added. `OTEL_*` exporter settings
+cannot enable a network exporter in this implementation. JSON logging and telemetry
+export are independent opt-ins. Service names are `task-engine-api`,
+`task-engine-worker`, `task-engine-dispatcher` and `task-engine-operator`. Library
+callers can explicitly call `telemetry.initialize(component)` before work; the first
+initialization in a process wins. CLI processes are intended to run separately.
+
+The spans are `api.submit`, `api.lookup`, `worker.claim`, `worker.handle`,
+`worker.finish`, `worker.recover`, `dispatcher.claim`, `dispatcher.receive`,
+`dispatcher.finish`, `dispatcher.recover` and `operator.replay`. Submission spans
+report created/replayed/conflict; lookup reports found/not_found. Fenced transition
+spans record committed outcomes only after commit confirmation. Recovery scan spans
+in the dispatcher report `observed` inside the claim transaction; the enclosing
+claim span includes commit and recovery metrics/logs follow commit confirmation.
+Errors use bounded outcomes with no exception events or status descriptions.
+Invalid requests rejected before entering an endpoint are outside these manual
+spans; there is no automatic HTTP/SQL instrumentation.
+
+### Telemetry schema and interpretation
+
+Metric names below all start with `task_engine.`. All counters are cumulative and
+process-local. Dimensions are restricted to `component`, `operation`, `outcome`
+and optional predefined `error_code` (`retryable_error`, `permanent_error`,
+`unexpected_error`, `database_error`, `lease_expired`).
+
+| Metric suffix | Operation | Outcomes | Meaning |
+| --- | --- | --- | --- |
+| `job.submissions` | api.submit | created / replayed / conflict | Confirmed submission transaction; only created represents a new job |
+| `job.claims` | worker.claim | claimed | Confirmed claim, including a later attempt |
+| `job.transitions` | worker.finish | succeeded / failed / retry | Confirmed fenced success, terminal failure or retry scheduling |
+| `job.recoveries` | worker.recover | retry / failed | Confirmed expired-lease recovery; error_code=lease_expired |
+| `job.executions` | worker.handle | succeeded / predefined processing error | Handler invocation observations, independent of completion commit |
+| `delivery.attempts` | dispatcher.claim | claimed | Confirmed claim, including an expired reclaim; invocation is not guaranteed |
+| `delivery.receives` | dispatcher.receive | succeeded / predefined processing error | Receiver invocation observations; duplicate acceptance is also succeeded |
+| `delivery.transitions` | dispatcher.finish | acknowledged / retry / dead_letter | Confirmed fenced delivery transition |
+| `delivery.recoveries` | dispatcher.recover | reclaimed / dead_letter | Confirmed expired reclaim or exhausted expiry recovery |
+| `operator.replays` | operator.replay | replayed / invalid_budget / event_not_found / event_not_dead_letter / budget_or_counter_overflow / database_error / unexpected_error / interrupted | replayed requires confirmed commit; other values are rejected/error observations |
+| `handler.duration` | worker.handle | same as job.executions | Histogram of observed processing seconds using a monotonic clock |
+| `receiver.duration` | dispatcher.receive | same as delivery.receives | Histogram of observed processing seconds including receiver transaction/commit |
+
+Processing error outcomes are retryable_error, permanent_error, unexpected_error,
+database_error and interrupted. Interrupted processing propagates without inventing
+a state transition. A failed handler can cause either retry or terminal failure;
+its observation is distinct from that committed transition. A successful receiver
+observation is distinct from sender acknowledgement and from inserting a new
+receiver row.
+
+**These metrics are best-effort observations, not durable database facts.** Even
+confirmed-transition counters can miss a crash after commit but before recording,
+an uncertain commit, disabled periods or export failure, and they reset on restart.
+Lost commit confirmation never increments a success counter. Export/instrument
+failures cannot turn a confirmed business commit into an application failure.
+Use the diagnostic snapshot for authoritative aggregate state at its database
+statement snapshot/time, including remaining-budget eligibility in due counts:
+
+```json
+{"jobs_by_status":{"succeeded":1},"outbox_by_delivery_state":{"delivered":1},"due_pending_jobs":0,"due_pending_outbox_events":0,"expired_job_leases":0,"expired_delivery_leases":0,"dead_letter_events":0}
+```
+
+The snapshot runs one read-only SELECT, returns no sensitive rows and performs no
+cleanup or lease recovery. It is an on-demand local command, not a public endpoint.
+
+### Privacy, cardinality and trace boundaries
+
+Span names, metric names, resources and dimension values are explicitly allowlisted.
+Payload/event JSON, Idempotency-Key, job/event UUIDs, lease/delivery tokens, SQL/bind
+parameters, credentials and arbitrary exception text never enter spans or metrics.
+Metric exemplars and automatic exception/stack-trace recording are disabled.
+Resources contain only the fixed service name; ambient resource attributes are
+ignored. Existing human diagnostics may include UUIDs where ownership diagnosis
+requires them. UUIDs never become metric labels.
+
+JSON logs contain only timestamp, level, component, event and outcome; raw messages,
+arguments, arbitrary extras, exception details and stack information are discarded.
+Fixed error codes remain. Human formatting remains the default. No verbose SQL or
+driver logging is enabled. Future log handlers/infrastructure must preserve this
+policy too.
+
+Queue rows do not persist trace context. There is **no end-to-end cross-process
+parent/child trace guarantee** from API through worker to dispatcher. Nested spans
+within a process can share context. A dead letter still does not prove absence of
+a receiver effect. Instrumentation changes none of the retry, ownership, outbox,
+delivery or replay guarantees above.
+
+### Safe local examples
+
+Actual console exports include trace IDs, timestamps and full SDK metric envelopes.
+The following excerpts omit those envelopes for readability:
+
+```json
+{"name":"worker.finish","attributes":{"component":"worker","operation":"finish","outcome":"succeeded"},"events":[]}
+{"name":"dispatcher.finish","attributes":{"component":"dispatcher","operation":"finish","outcome":"acknowledged"},"events":[]}
+{"name":"task_engine.delivery.transitions","value":1,"attributes":{"component":"dispatcher","operation":"finish","outcome":"acknowledged"}}
+{"timestamp":"2026-11-12T00:00:00+00:00","level":"INFO","component":"dispatcher","event":"finish","outcome":"acknowledged"}
+```
+
+The log timestamp above is illustrative. See [phase 3A validation](docs/phase-3a-validation.md)
+for the executed synthetic smoke demonstration, actual selected output and
+reproducible commands using an isolated disposable database. No private source
+material or external business data is used. See [ADR 0007](docs/adr/0007-observability.md)
+for the design, commit boundaries and deferred OTLP work.

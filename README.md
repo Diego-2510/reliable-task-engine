@@ -1,10 +1,38 @@
-# Reliable Task Engine — phase 3B
+# Reliable Task Engine
 
-A small PostgreSQL-backed job queue with a FastAPI service and independent polling workers. Python 3.12 and the checked-in uv lockfile define the application environment. Handlers are synthetic and perform no external business effects.
+A small job engine demonstrating crash recovery, fenced ownership and transactional
+outbox delivery with **FastAPI and PostgreSQL 16**. Independent Python workers
+claim jobs using `FOR UPDATE SKIP LOCKED`. PostgreSQL keeps queue state, leases,
+submission keys and outbox intent in one transactional authority, without a broker.
+Handlers and receiver effects are synthetic.
+
+- **Reliability:** durable submission idempotency; bounded attempts; database-time
+  leases that reject stale writers; atomic job success + outbox intent; stable
+  event IDs and one persisted synthetic receiver effect per retained ID.
+- **Evidence:** Phase 4A local validation covers the full PostgreSQL suite,
+  real worker SIGKILL, commit uncertainty, dispatcher crash/replay and a clean HEAD
+  image smoke. [Audit and actual results](docs/reliability-audit.md).
+  The supplied GitHub Actions baseline succeeded at `7a590c8`; local audit changes
+  have no new CI result.
+- **Measured:** job-only throughput increased from **46.90 to 316.81 jobs/s**
+  with 1→8 workers (**6.76×**). With one dispatcher, acknowledgement rates stayed
+  **39.94–42.20 events/s**. These are synthetic backlog-drain measurements.
+  [Method, recorded CSVs and provenance](docs/benchmarks.md).
+- **Scope:** at-least-once attempts with finite budgets; no exactly-once processing
+  or delivery, authentication, tenant isolation, real HTTP downstream receiver,
+  payload-size limit or automatic retention. Local trusted use only; no
+  production-facing network deployment.
+
+Python 3.12 and `uv.lock` define the application environment. Start below, then see
+[release readiness and operations](docs/release-readiness.md),
+[guarantees and limitations](docs/reliability-audit.md#guarantees-and-boundaries),
+and the [ADRs](docs/adr/0001-leases-and-fencing.md).
+Version remains **0.1.0**. Licensing is pending owner review of
+[the MIT candidate](LICENSE.candidate); it is not an adopted license.
 
 ## Quickstart
 
-Run `docker compose up --build --scale worker=2` for a new installation. The migration runs before the API, workers and dispatcher. Compose starts one dispatcher automatically, with no additional public port. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -d '{"payload":{"example":1},"max_attempts":3}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects. Omitting `max_attempts` retains the default of 3. `{"fail":true}` permanently fails on its first attempt. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
+Run `docker compose up --build --scale worker=2` for a new installation. The migration runs before the API, workers and dispatcher. Compose starts one dispatcher automatically, with no additional public port. Submit a job with `curl -X POST localhost:8000/v1/jobs -H 'Content-Type: application/json' -H 'Idempotency-Key: quickstart-1' -d '{"payload":{"example":1,"emit_outbox_event":true},"max_attempts":3}'`, then retrieve its UUID with `curl localhost:8000/v1/jobs/<id>`. Payloads are JSON objects. Omitting `max_attempts` retains the default of 3. `{"fail":true}` permanently fails on its first attempt. Validation errors and missing jobs return `{"error":{"code":...,"message":...}}`.
 
 For local development: `uv sync --locked`; start PostgreSQL, set `DATABASE_URL` if needed, run `uv run alembic upgrade head`, then `uv run uvicorn task_engine.api:app`, `uv run python -m task_engine.worker` and, in a separate process, `uv run python -m task_engine.dispatcher`. Default connection is `postgresql+psycopg://task:task@localhost:5432/task`. The Compose credentials are for local development only.
 
@@ -154,7 +182,7 @@ docker compose config -q
 docker rm --force rte-test-db
 ```
 
-Integration coverage includes eight-process initial and scheduled recovery claims, bounded classified failures, success after retries, permanent failure, retry eligibility without sleeps, recovery exhaustion, stale success/failure/retry rejection, completion/recovery races, migration from 0001/0002 with legacy attempts above 3/10, and destructive-configuration rejection before deletion. See the [phase-2B validation record](docs/phase-2b-validation.md). GitHub Actions is configured; no successful remote CI run is claimed.
+Integration coverage includes eight-process initial and scheduled recovery claims, bounded classified failures, success after retries, permanent failure, retry eligibility without sleeps, recovery exhaustion, stale success/failure/retry rejection, completion/recovery races, migration from 0001/0002 with legacy attempts above 3/10, and destructive-configuration rejection before deletion. See the [phase-2B validation record](docs/phase-2b-validation.md). The supplied baseline GitHub Actions result at `7a590c8` is SUCCESS. No CI result is claimed for uncommitted Phase 4A changes.
 
 Phase-2D-1 adds PostgreSQL tests for atomic visibility/rollback, opt-in and payload filtering, stale/concurrent completions, recovery after completion failure, database constraints and data preservation through `0004 → 0005 → 0004`. See the [phase-2D-1 validation record](docs/phase-2d1-validation.md).
 
@@ -337,7 +365,10 @@ Median job-only throughput was **46.90 / 93.47 / 166.62 / 316.81 jobs/s** at
 1/2/4/8 workers (8-worker speedup **6.76×**, efficiency **84.4%**). Outbox job
 terminalization reached **284.42 jobs/s** with eight workers, while acknowledgement
 throughput remained **39.94–42.20 events/s** across worker counts with one dispatcher.
-Every baseline correctness gate passed: 24,000 measured jobs and 12,000 delivered
+The baseline was recorded on a dirty tree at `33e83cf`; Phase 4A verified its
+recorded source/config fingerprint against committed `7a590c8` exactly. This
+establishes source equivalence, not a clean-tree measurement. Every saved baseline
+correctness gate passed: 24,000 measured jobs and 12,000 delivered
 unique events/effects; no invalid or missing cases. This supports worker scaling
 for synthetic job draining and indicates a delivery-side limit with one dispatcher;
 it does not identify whether CPU, SQL round trips, WAL or storage is dominant.

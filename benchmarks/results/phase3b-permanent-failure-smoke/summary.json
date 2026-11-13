@@ -1,0 +1,92 @@
+{
+  "complete": true,
+  "missing_cases": [],
+  "invalid_runs": [],
+  "aggregation": "median per-run throughput; pooled measured latency samples per config",
+  "groups": [
+    {
+      "profile": "permanent_failure_5pct",
+      "workers": 1,
+      "valid_repetitions": 1,
+      "job_throughput_median": 49.13341142009336,
+      "succeeded": 19,
+      "failed": 1,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 222.321,
+        "p95_ms": 371.209,
+        "p99_ms": null,
+        "min_ms": 39.396,
+        "max_ms": 388.772,
+        "mean_ms": 221.81414999999998
+      },
+      "job_speedup": 1.0,
+      "job_scaling_efficiency": 1.0
+    },
+    {
+      "profile": "permanent_failure_5pct",
+      "workers": 2,
+      "valid_repetitions": 1,
+      "job_throughput_median": 84.98129990558654,
+      "succeeded": 19,
+      "failed": 1,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 125.72,
+        "p95_ms": 225.63,
+        "p99_ms": null,
+        "min_ms": 36.992,
+        "max_ms": 232.0,
+        "mean_ms": 129.52925
+      },
+      "job_speedup": 1.7296030837140897,
+      "job_scaling_efficiency": 0.8648015418570448
+    },
+    {
+      "profile": "permanent_failure_5pct",
+      "workers": 4,
+      "valid_repetitions": 1,
+      "job_throughput_median": 114.21935156592653,
+      "succeeded": 19,
+      "failed": 1,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 87.985,
+        "p95_ms": 148.424,
+        "p99_ms": null,
+        "min_ms": 33.508,
+        "max_ms": 151.247,
+        "mean_ms": 89.58330000000001
+      },
+      "job_speedup": 2.3246778162693573,
+      "job_scaling_efficiency": 0.5811694540673393
+    },
+    {
+      "profile": "permanent_failure_5pct",
+      "workers": 8,
+      "valid_repetitions": 1,
+      "job_throughput_median": 113.18794516567321,
+      "succeeded": 19,
+      "failed": 1,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 69.698,
+        "p95_ms": 96.998,
+        "p99_ms": null,
+        "min_ms": 39.328,
+        "max_ms": 162.642,
+        "mean_ms": 70.1333
+      },
+      "job_speedup": 2.303685860481172,
+      "job_scaling_efficiency": 0.2879607325601465
+    }
+  ]
+}

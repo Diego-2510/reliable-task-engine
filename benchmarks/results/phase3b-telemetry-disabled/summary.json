@@ -1,0 +1,37 @@
+{
+  "complete": true,
+  "missing_cases": [],
+  "invalid_runs": [],
+  "aggregation": "median per-run throughput; pooled measured latency samples per config",
+  "groups": [
+    {
+      "profile": "job_outbox",
+      "workers": 2,
+      "valid_repetitions": 3,
+      "job_throughput_median": 82.8267097721848,
+      "succeeded": 3000,
+      "failed": 0,
+      "delivered": 3000,
+      "correctness": "all gates passed",
+      "delivery_throughput_median": 41.62761168484151,
+      "job_latency": {
+        "count": 3000,
+        "p50_ms": 5982.928,
+        "p95_ms": 11481.873,
+        "p99_ms": 11969.422,
+        "min_ms": 35.221,
+        "max_ms": 12149.526,
+        "mean_ms": 6004.227194
+      },
+      "outbox_latency": {
+        "count": 3000,
+        "p50_ms": 13604.336,
+        "p95_ms": 23024.484,
+        "p99_ms": 23833.926,
+        "min_ms": 1043.373,
+        "max_ms": 24221.907,
+        "mean_ms": 13225.350934
+      }
+    }
+  ]
+}

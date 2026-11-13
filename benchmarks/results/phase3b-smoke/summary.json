@@ -1,0 +1,224 @@
+{
+  "complete": true,
+  "missing_cases": [],
+  "invalid_runs": [],
+  "aggregation": "median per-run throughput; pooled measured latency samples per config",
+  "groups": [
+    {
+      "profile": "job_only",
+      "workers": 1,
+      "valid_repetitions": 1,
+      "job_throughput_median": 58.39527596458451,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 194.234,
+        "p95_ms": 319.989,
+        "p99_ms": null,
+        "min_ms": 37.564,
+        "max_ms": 333.94,
+        "mean_ms": 195.30295
+      },
+      "job_speedup": 1.0,
+      "job_scaling_efficiency": 1.0
+    },
+    {
+      "profile": "job_only",
+      "workers": 2,
+      "valid_repetitions": 1,
+      "job_throughput_median": 83.43084383732418,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 107.315,
+        "p95_ms": 214.81,
+        "p99_ms": null,
+        "min_ms": 31.516,
+        "max_ms": 232.067,
+        "mean_ms": 123.18915
+      },
+      "job_speedup": 1.4287259107727002,
+      "job_scaling_efficiency": 0.7143629553863501
+    },
+    {
+      "profile": "job_only",
+      "workers": 4,
+      "valid_repetitions": 1,
+      "job_throughput_median": 152.9516221980269,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 76.867,
+        "p95_ms": 118.432,
+        "p99_ms": null,
+        "min_ms": 31.665,
+        "max_ms": 126.277,
+        "mean_ms": 77.73085
+      },
+      "job_speedup": 2.6192465001927348,
+      "job_scaling_efficiency": 0.6548116250481837
+    },
+    {
+      "profile": "job_only",
+      "workers": 8,
+      "valid_repetitions": 1,
+      "job_throughput_median": 177.79270752985678,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 0,
+      "correctness": "all gates passed",
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 68.811,
+        "p95_ms": 97.106,
+        "p99_ms": null,
+        "min_ms": 42.391,
+        "max_ms": 97.484,
+        "mean_ms": 66.9346
+      },
+      "job_speedup": 3.0446419610669238,
+      "job_scaling_efficiency": 0.38058024513336547
+    },
+    {
+      "profile": "job_outbox",
+      "workers": 1,
+      "valid_repetitions": 1,
+      "job_throughput_median": 38.186566754934205,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 20,
+      "correctness": "all gates passed",
+      "delivery_throughput_median": 11.6818956584518,
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 263.738,
+        "p95_ms": 484.875,
+        "p99_ms": null,
+        "min_ms": 43.183,
+        "max_ms": 506.635,
+        "mean_ms": 279.21285
+      },
+      "outbox_latency": {
+        "count": 20,
+        "p50_ms": 1485.978,
+        "p95_ms": 1670.873,
+        "p99_ms": null,
+        "min_ms": 1057.26,
+        "max_ms": 1691.368,
+        "mean_ms": 1424.9475
+      },
+      "job_speedup": 1.0,
+      "job_scaling_efficiency": 1.0,
+      "delivery_speedup": 1.0,
+      "delivery_scaling_efficiency": 1.0
+    },
+    {
+      "profile": "job_outbox",
+      "workers": 2,
+      "valid_repetitions": 1,
+      "job_throughput_median": 65.97493488300188,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 20,
+      "correctness": "all gates passed",
+      "delivery_throughput_median": 12.809915513924052,
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 147.902,
+        "p95_ms": 292.898,
+        "p99_ms": null,
+        "min_ms": 34.016,
+        "max_ms": 295.535,
+        "mean_ms": 164.601
+      },
+      "outbox_latency": {
+        "count": 20,
+        "p50_ms": 1307.354,
+        "p95_ms": 1526.407,
+        "p99_ms": null,
+        "min_ms": 1058.112,
+        "max_ms": 1551.87,
+        "mean_ms": 1310.46885
+      },
+      "job_speedup": 1.727700091668415,
+      "job_scaling_efficiency": 0.8638500458342075,
+      "delivery_speedup": 1.0965613705559965,
+      "delivery_scaling_efficiency": 0.5482806852779982
+    },
+    {
+      "profile": "job_outbox",
+      "workers": 4,
+      "valid_repetitions": 1,
+      "job_throughput_median": 101.2255703740634,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 20,
+      "correctness": "all gates passed",
+      "delivery_throughput_median": 13.321608434841687,
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 105.051,
+        "p95_ms": 165.35,
+        "p99_ms": null,
+        "min_ms": 42.122,
+        "max_ms": 179.179,
+        "mean_ms": 106.22315
+      },
+      "outbox_latency": {
+        "count": 20,
+        "p50_ms": 1276.187,
+        "p95_ms": 1468.884,
+        "p99_ms": null,
+        "min_ms": 1058.12,
+        "max_ms": 1488.445,
+        "mean_ms": 1280.44175
+      },
+      "job_speedup": 2.650816215652163,
+      "job_scaling_efficiency": 0.6627040539130408,
+      "delivery_speedup": 1.1403635868981215,
+      "delivery_scaling_efficiency": 0.28509089672453036
+    },
+    {
+      "profile": "job_outbox",
+      "workers": 8,
+      "valid_repetitions": 1,
+      "job_throughput_median": 75.36517553295656,
+      "succeeded": 20,
+      "failed": 0,
+      "delivered": 20,
+      "correctness": "all gates passed",
+      "delivery_throughput_median": 12.161835008356535,
+      "job_latency": {
+        "count": 20,
+        "p50_ms": 211.455,
+        "p95_ms": 240.58,
+        "p99_ms": null,
+        "min_ms": 67.137,
+        "max_ms": 241.741,
+        "mean_ms": 197.75155
+      },
+      "outbox_latency": {
+        "count": 20,
+        "p50_ms": 1295.844,
+        "p95_ms": 1599.511,
+        "p99_ms": null,
+        "min_ms": 1085.746,
+        "max_ms": 1625.39,
+        "mean_ms": 1338.6079
+      },
+      "job_speedup": 1.9736043833586685,
+      "job_scaling_efficiency": 0.24670054791983356,
+      "delivery_speedup": 1.0410840298472877,
+      "delivery_scaling_efficiency": 0.13013550373091096
+    }
+  ]
+}

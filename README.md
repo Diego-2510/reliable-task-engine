@@ -1,4 +1,4 @@
-# Reliable Task Engine — phase 3A
+# Reliable Task Engine — phase 3B
 
 A small PostgreSQL-backed job queue with a FastAPI service and independent polling workers. Python 3.12 and the checked-in uv lockfile define the application environment. Handlers are synthetic and perform no external business effects.
 
@@ -292,3 +292,59 @@ for the executed synthetic smoke demonstration, actual selected output and
 reproducible commands using an isolated disposable database. No private source
 material or external business data is used. See [ADR 0007](docs/adr/0007-observability.md)
 for the design, commit boundaries and deferred OTLP work.
+
+## Benchmarks
+
+The standalone suite measures synthetic PostgreSQL backlog draining with 1/2/4/8
+worker processes, three repetitions of 1000 jobs per configuration and a separate
+100-job warm-up. Job-only and job-plus-outbox measurements report job completion
+and delivery acknowledgement separately; the latter holds one dispatcher constant.
+No production runtime or state transitions are changed.
+
+```sh
+uv sync --locked
+docker compose -f benchmarks/compose.yaml up -d --wait
+export BENCHMARK_DATABASE=1
+export BENCHMARK_DATABASE_URL=postgresql+psycopg://benchmark:benchmark@127.0.0.1:55452/rte_benchmark_test
+uv run python -m benchmarks prepare
+TASK_ENGINE_TELEMETRY=disabled uv run python -m benchmarks run \
+  --profiles job_only job_outbox --workers 1,2,4,8 \
+  --size 1000 --warmup 100 --repetitions 3 --seed 20261113 \
+  --lease-seconds 60 --timeout 120 --telemetry disabled \
+  --docker-container rte-benchmark-db-1
+```
+
+This creates a dedicated persistent Docker volume; no tmpfs baseline is used.
+Never point the explicit benchmark URL at development/production data. Safety
+checks require an empty DB for initial migration, benchmark ownership for cleanup,
+an actual database-name check, and verified persistent storage for measurements.
+Use `uv run python -m benchmarks run --smoke` for a functional check; tiny smoke
+samples suppress p99. See the [reproduction guide](docs/benchmarks.md),
+[ADR 0008](docs/adr/0008-benchmark-methodology.md), and
+[validation record](docs/phase-3b-validation.md).
+
+Measured evidence: [baseline report](benchmarks/results/phase3b-baseline/report.md),
+[environment manifest](benchmarks/results/phase3b-baseline/manifest.json),
+[summary](benchmarks/results/phase3b-baseline/summary.json),
+[functional smoke](benchmarks/results/phase3b-smoke/report.md), and the controlled
+[disabled](benchmarks/results/phase3b-telemetry-disabled/report.md) /
+[console telemetry](benchmarks/results/phase3b-telemetry-console/report.md) comparison.
+Host: Intel Core Ultra 7 255H, 16 logical CPUs, 30.28 GiB physical RAM,
+Ubuntu 24.04.3, Python 3.12.3, PostgreSQL 16.15; dedicated local Docker volume on
+ext4, fsync/synchronous_commit/full_page_writes on; telemetry disabled.
+
+Median job-only throughput was **46.90 / 93.47 / 166.62 / 316.81 jobs/s** at
+1/2/4/8 workers (8-worker speedup **6.76×**, efficiency **84.4%**). Outbox job
+terminalization reached **284.42 jobs/s** with eight workers, while acknowledgement
+throughput remained **39.94–42.20 events/s** across worker counts with one dispatcher.
+Every baseline correctness gate passed: 24,000 measured jobs and 12,000 delivered
+unique events/effects; no invalid or missing cases. This supports worker scaling
+for synthetic job draining and indicates a delivery-side limit with one dispatcher;
+it does not identify whether CPU, SQL round trips, WAL or storage is dominant.
+
+Latencies are backlog-drain completion latencies from a common DB-clock origin,
+including queue wait. There is no HTTP ingress/network downstream measurement.
+Synthetic handlers are effectively no-op work; PostgreSQL may dominate scaling
+and one dispatcher may constrain outbox throughput. Cache, WAL, I/O, CPU contention
+and shared-host activity affect results. No production workload equivalence or
+population p99/SLA guarantee is claimed.

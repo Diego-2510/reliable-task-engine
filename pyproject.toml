@@ -24,4 +24,5 @@ line-length = 100
 python_version = "3.12"
 strict = true
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "benchmarks/tests"]
+pythonpath = ["."]

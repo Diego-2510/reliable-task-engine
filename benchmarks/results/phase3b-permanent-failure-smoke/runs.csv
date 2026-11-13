@@ -1,0 +1,9 @@
+run,phase,profile,workers,dispatchers,repetition,size,seed,telemetry,valid,error,job_elapsed_seconds,delivery_elapsed_seconds,job_throughput,delivery_throughput,succeeded,failed,events,delivered,dead_letters,active_leases,duplicate_ids,start_db_utc
+001,warmup,permanent_failure_5pct,1,0,1,5,20261113,disabled,True,,0.13214835908729583,,37.83626247448939,,5,0,0,0,0,0,0,2026-11-13T22:15:40.421178+00:00
+002,measured,permanent_failure_5pct,1,0,1,20,20261113,disabled,True,,0.407054984010756,,49.13341142009336,,19,1,0,0,0,0,0,2026-11-13T22:15:41.419584+00:00
+003,warmup,permanent_failure_5pct,2,0,1,5,20261113,disabled,True,,0.10898436792194843,,45.87813918029841,,5,0,0,0,0,0,0,2026-11-13T22:15:42.548020+00:00
+004,measured,permanent_failure_5pct,2,0,1,20,20261113,disabled,True,,0.2353458940051496,,84.98129990558654,,19,1,0,0,0,0,0,2026-11-13T22:15:43.422620+00:00
+005,warmup,permanent_failure_5pct,4,0,1,5,20261113,disabled,True,,0.06774117099121213,,73.81035678654914,,5,0,0,0,0,0,0,2026-11-13T22:15:44.556334+00:00
+006,measured,permanent_failure_5pct,4,0,1,20,20261113,disabled,True,,0.17510167695581913,,114.21935156592653,,19,1,0,0,0,0,0,2026-11-13T22:15:45.587412+00:00
+007,warmup,permanent_failure_5pct,8,0,1,5,20261113,disabled,True,,0.06757409998681396,,73.99284638605135,,5,0,0,0,0,0,0,2026-11-13T22:15:46.762615+00:00
+008,measured,permanent_failure_5pct,8,0,1,20,20261113,disabled,True,,0.17669726198073477,,113.18794516567321,,19,1,0,0,0,0,0,2026-11-13T22:15:47.937864+00:00

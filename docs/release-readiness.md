@@ -1,16 +1,20 @@
-# First release readiness: proposed v0.1.0
+# First release readiness: v0.1.0 candidate
 
-**NO-GO for public release today.** The defined local synthetic MVP passes its
-technical acceptance checks. Owner licensing review, review/commit of the local
-candidate, and CI on that eventual release commit remain outstanding. No P0/P1
-runtime release blocker was confirmed. Nothing was committed, tagged or published.
+**GO for local candidate review; NO-GO for publication until owner review and
+remote CI on the exact release commit.** Package version is **0.1.0**; target tag is
+**v0.1.0**. No commit, tag or GitHub Release is created by Phase 4B.
 
-The audited baseline is clean `main` at
-`7a590c8b23ac064cedba95faa8104e9894bae413`, with the user-supplied GitHub Actions
-SUCCESS. Local Phase 4A changes have no CI result. `pyproject.toml` remains
-`0.1.0`; recommend **v0.1.0** for the first public tag, consistent with the package.
-If a separate prerelease is desired later, align its package/tag versions through
-an explicit owner decision. No version bump or tag is justified by this audit.
+Owner-approved [MIT](../LICENSE) is adopted in the local candidate, copyright
+2026 Diego Ringleb. Dependencies retain their own licenses. Phase 4A is committed
+at `91ef58585af5f62446fa5349e7b034549a5cdb0f` and has
+[passing remote CI](https://github.com/Diego-2510/reliable-task-engine/actions/runs/43529511460),
+verified read-only during Phase 4B on 2026-11-15. That result does not validate
+these subsequent local changes. No confirmed P0/P1 defect was found in the
+historical audit; current results belong in [Phase 4B validation](phase-4b-validation.md).
+
+The [case study](case-study.md) explains the design; [proposed release notes](releases/v0.1.0.md)
+are ready for owner review. The Phase 4A results retained below remain historical evidence,
+including its then-pending license and earlier baseline; it is not current status.
 
 [The reliability audit](reliability-audit.md) contains the component inventory,
 A–J guarantee matrix, findings, exact benchmark provenance and test evidence.
@@ -183,9 +187,9 @@ event: inspect before repeating. Never delete the receiver ID, replace the event
 ID, decrease counters or downgrade to make an event eligible. There is no supported
 job replay command or append-only operator/failure history.
 
-## Clean-checkout reproduction and validation
+## Clean-checkout reproduction and historical Phase 4A validation
 
-The executed smoke used `git archive HEAD`, an empty uv cache, a clean-source
+The Phase 4A smoke used `git archive HEAD`, an empty uv cache, a clean-source
 Docker image, an isolated internal network and separate fresh PG16 storage.
 To repeat installation/build without overwriting a working directory:
 
@@ -250,10 +254,11 @@ TEST_DATABASE=1 BENCHMARK_DATABASE=1 uv run pytest -ra
 
 Abort on any database-creation failure; do not adopt an already existing database
 as disposable. Run these commands before removing that container/volume. The
-clean export tests the selected HEAD; the added Phase 4A test joins it only after
-an authorized future commit, or runs now in the local candidate working tree.
+clean export tests the selected HEAD. For an uncommitted candidate, overlay only
+the explicitly reviewed changed/new files into the export; document that scope
+rather than describing it as an existing clean release commit.
 
-Required check commands and actual audit results:
+Historical Phase 4A check commands and results (not a Phase 4B execution):
 
 | Check | Actual result |
 | --- | --- |
@@ -293,34 +298,45 @@ independent network receiver, exactly-once or population p99 guarantee is suppor
 Historical raw database rows were not retained; recorded row-level correctness
 gates cannot be reconstructed from latency CSV alone.
 
-## Acceptance checklist and remaining owner work
+## Release checklist and human review gate
 
-- [x] Baseline/branch/status captured; initial local modifications absent.
-- [x] Inventory and A–J matrix distinguish enforced/tested/assumed/non-guarantees.
-- [x] No confirmed P0/P1 defect in the defined MVP; P2 issues recorded.
-- [x] Required failure boundaries tested on disposable PostgreSQL 16 only.
-- [x] Clean committed-HEAD installation/build and runtime smoke verified.
-- [x] Static/config/full-suite checks and saved-report regeneration passed.
-- [x] Benchmark provenance verified without rewriting measurements.
-- [x] README overview, operations/recovery and limitations prepared.
-- [x] Candidate files, secret patterns and whitespace reviewed locally.
-- [ ] Owner chooses a license. Review `LICENSE.candidate` (MIT, copyright 2026
-  Diego Ringleb); if approved, adopt it as `LICENSE` through an authorized change.
-  The candidate is a proposal and is not an adopted license.
-- [ ] Owner reviews/accepts local-MVP limitations, especially AUD-04 shutdown/DB
-  timeout/manual restart behavior and AUD-05 trusted-network scope.
-- [ ] Owner authorizes commit/publishing work separately. Before any future commit,
-  verify effective author **and** committer are Diego Ringleb with the configured,
-  verified GitHub email; do not change identity settings or add AI coauthor trailers.
-- [ ] Run required CI against the eventual exact release commit, including any
-  owner-requested edits. The current clean-HEAD smoke validates baseline runtime
-  inputs; local changes are README, audit/runbook, license candidate and one test.
-- [ ] Before an authorized push, verify authenticated GitHub account **Diego-2510**.
-- [ ] With explicit owner authorization, tag the reviewed passing commit `v0.1.0`
-  and publish release notes linked to its evidence. Do not imply that this audit
-  authorized a commit, push, tag, PR, license adoption or release.
+These entries describe the Phase 4B candidate; checkmarks do not authorize publishing.
 
-Changed files: README.md, docs/reliability-audit.md, docs/release-readiness.md,
-LICENSE.candidate and tests/test_process_recovery.py. Runtime, migrations, CI,
-Docker/Compose, pyproject, uv.lock and all measured artifacts are unchanged.
-No scope-expanding authentication, broker, adapter or architecture was added.
+- [x] Local release candidate ready: current checks and human-review summary complete.
+- [x] Owner-approved MIT license adopted locally; attribution and package metadata verified.
+- [x] Full local suite passed: **350 passed, 26 warnings, 83.27 s**, zero skipped;
+  [Phase 4B validation](phase-4b-validation.md) records all current checks.
+- [ ] Owner accepts documented trusted-local limitations and reviews the exact diff.
+- [ ] Release commit exists containing the entire reviewed candidate.
+- [ ] Remote CI passed on that **exact release commit**, including all final edits.
+- [ ] Tag `v0.1.0` points to that same commit; package version is `0.1.0`.
+- [ ] GitHub Release published from that tag with reviewed release notes.
+
+Before any later authorized commit, verify effective author **and** committer are
+Diego Ringleb with the configured, verified GitHub email. Do not change identity
+settings or add AI coauthor trailers. Before an authorized push verify authenticated
+GitHub account **Diego-2510**. Commit, push, tagging and release publication require
+separate explicit authorization and are not actions of this task.
+
+There is no exact release SHA yet. `91ef58585af5f62446fa5349e7b034549a5cdb0f`
+is the parent baseline, not the commit to tag for this candidate. After review and
+an authorized commit, record `git rev-parse HEAD`, verify its tree includes all
+reviewed files, and require CI on that SHA. Any subsequent edit needs a new commit
+and its own successful CI before tagging.
+
+Suggested local commit candidates (neither is created here):
+
+1. `Adopt MIT license and package license metadata`: LICENSE, pyproject.toml,
+   Dockerfile. Remove the untracked candidate name by adopting its content.
+2. `Prepare v0.1.0 release candidate and engineering case study`: README.md,
+   docs/case-study.md, docs/releases/v0.1.0.md, docs/release-readiness.md,
+   docs/phase-4b-validation.md. Tag the second commit only after its CI passes.
+
+A single reviewed commit containing both groups is also valid. Never tag the
+license-only intermediate commit. Keep validation observations tied to their
+actual working-tree execution context.
+
+For later publication, use the proposed notes' absolute versioned URLs so the
+body works on GitHub Releases as well as in the repository. Verify those URLs
+after the tag exists. Remove the notes' candidate-status paragraph from the
+publication body, retaining the first-tagged-release description and limitations.

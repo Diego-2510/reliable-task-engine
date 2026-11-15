@@ -1,34 +1,40 @@
 # Reliable Task Engine
 
-A small job engine demonstrating crash recovery, fenced ownership and transactional
-outbox delivery with **FastAPI and PostgreSQL 16**. Independent Python workers
-claim jobs using `FOR UPDATE SKIP LOCKED`. PostgreSQL keeps queue state, leases,
-submission keys and outbox intent in one transactional authority, without a broker.
-Handlers and receiver effects are synthetic.
+[![CI](https://github.com/Diego-2510/reliable-task-engine/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Diego-2510/reliable-task-engine/actions/workflows/ci.yml)
 
-- **Reliability:** durable submission idempotency; bounded attempts; database-time
-  leases that reject stale writers; atomic job success + outbox intent; stable
-  event IDs and one persisted synthetic receiver effect per retained ID.
-- **Evidence:** Phase 4A local validation covers the full PostgreSQL suite,
-  real worker SIGKILL, commit uncertainty, dispatcher crash/replay and a clean HEAD
-  image smoke. [Audit and actual results](docs/reliability-audit.md).
-  The supplied GitHub Actions baseline succeeded at `7a590c8`; local audit changes
-  have no new CI result.
-- **Measured:** job-only throughput increased from **46.90 to 316.81 jobs/s**
-  with 1→8 workers (**6.76×**). With one dispatcher, acknowledgement rates stayed
-  **39.94–42.20 events/s**. These are synthetic backlog-drain measurements.
-  [Method, recorded CSVs and provenance](docs/benchmarks.md).
-- **Scope:** at-least-once attempts with finite budgets; no exactly-once processing
-  or delivery, authentication, tenant isolation, real HTTP downstream receiver,
-  payload-size limit or automatic retention. Local trusted use only; no
-  production-facing network deployment.
+A durable background job engine built with **Python 3.12, FastAPI, SQLAlchemy and
+PostgreSQL 16**. It explores crash recovery and transactional delivery using one
+PostgreSQL authority, independent polling workers and no external broker.
 
-Python 3.12 and `uv.lock` define the application environment. Start below, then see
-[release readiness and operations](docs/release-readiness.md),
-[guarantees and limitations](docs/reliability-audit.md#guarantees-and-boundaries),
-and the [ADRs](docs/adr/0001-leases-and-fencing.md).
-Version remains **0.1.0**. Licensing is pending owner review of
-[the MIT candidate](LICENSE.candidate); it is not an adopted license.
+- **Core guarantees:** submission idempotency, `SKIP LOCKED` claims, leased ownership
+  with stale-writer rejection, bounded retries, atomic job success/outbox intent,
+  stable event IDs and durable synthetic receiver deduplication.
+- **Inspect the engineering:** [case study](docs/case-study.md),
+  [architecture decisions](docs/adr/0001-leases-and-fencing.md),
+  [reliability audit](docs/reliability-audit.md),
+  [tests](#validation) and [benchmark reproduction](docs/benchmarks.md).
+- **Boundaries:** synthetic no-op handlers and receiver DB rows; no authentication,
+  tenancy, real downstream HTTP, automatic retention or graceful worker drain.
+  At-least-once attempts with finite budgets; no exactly-once execution or delivery.
+  **Trusted local use only; no production-facing deployment.**
+
+| Saved synthetic baseline | 1 worker | 8 workers |
+| --- | ---: | ---: |
+| Job-only throughput | 46.90 jobs/s | 316.81 jobs/s |
+| Outbox acknowledgements, one dispatcher | 41.72 events/s | 42.20 events/s |
+
+Job-only speedup is **6.76×**, with **84.4% scaling efficiency** at eight workers.
+Acknowledgements span **39.94–42.20/s** across 1/2/4/8 workers. These are measured
+backlog-drain rates, not real-network delivery or HTTP end-to-end latency.
+[Saved report, CSVs and provenance](docs/benchmarks.md#results-and-limits).
+
+**v0.1.0 candidate:** [MIT](LICENSE) adopted locally, copyright 2026 Diego Ringleb.
+Dependencies retain their own licenses. Phase 4A commit
+[`91ef585`](https://github.com/Diego-2510/reliable-task-engine/commit/91ef58585af5f62446fa5349e7b034549a5cdb0f)
+has [passing remote CI](https://github.com/Diego-2510/reliable-task-engine/actions/runs/43529511460).
+The final release candidate still needs its own successful CI before tagging;
+no release is published by this preparation. See [release readiness](docs/release-readiness.md)
+and [proposed release notes](docs/releases/v0.1.0.md).
 
 ## Quickstart
 
@@ -182,7 +188,7 @@ docker compose config -q
 docker rm --force rte-test-db
 ```
 
-Integration coverage includes eight-process initial and scheduled recovery claims, bounded classified failures, success after retries, permanent failure, retry eligibility without sleeps, recovery exhaustion, stale success/failure/retry rejection, completion/recovery races, migration from 0001/0002 with legacy attempts above 3/10, and destructive-configuration rejection before deletion. See the [phase-2B validation record](docs/phase-2b-validation.md). The supplied baseline GitHub Actions result at `7a590c8` is SUCCESS. No CI result is claimed for uncommitted Phase 4A changes.
+Integration coverage includes eight-process initial and scheduled recovery claims, bounded classified failures, success after retries, permanent failure, retry eligibility without sleeps, recovery exhaustion, stale success/failure/retry rejection, completion/recovery races, migration from 0001/0002 with legacy attempts above 3/10, and destructive-configuration rejection before deletion. See the [phase-2B validation record](docs/phase-2b-validation.md). Phase 4A commit `91ef585` has [passing remote CI](https://github.com/Diego-2510/reliable-task-engine/actions/runs/43529511460). The local Phase 4B candidate requires CI on its eventual exact release commit before tagging.
 
 Phase-2D-1 adds PostgreSQL tests for atomic visibility/rollback, opt-in and payload filtering, stale/concurrent completions, recovery after completion failure, database constraints and data preservation through `0004 → 0005 → 0004`. See the [phase-2D-1 validation record](docs/phase-2d1-validation.md).
 
@@ -190,7 +196,7 @@ Phase-2D-2 adds real PostgreSQL coverage for eight concurrent dispatchers, stabl
 
 Phase-2D-3 adds bounded delivery, permanent rejection, exhausted-lease recovery, fenced dead-letter transitions, atomic operator replay and integer-boundary tests. Real PostgreSQL migration checks preserve historical `0006` events and receiver rows, including claims at the integer maximum. See the [phase-2D-3 validation record](docs/phase-2d3-validation.md).
 
-Next phase: design a real transport adapter and durable recipient idempotency contract, including timeouts/uncertain responses and deduplication retention across operator replay. Production metric aggregation, jitter, heartbeat and cancellation require follow-up semantics.
+Outside this release scope: design a real transport adapter and durable recipient idempotency contract, including timeouts/uncertain responses and deduplication retention across operator replay. Production metric aggregation, jitter, heartbeat and cancellation require follow-up semantics.
 
 
 ## Observability architecture and configuration
